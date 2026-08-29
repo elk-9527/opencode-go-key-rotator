@@ -1,0 +1,5 @@
+backups/
+test_env/
+__pycache__/
+*.pyc
+*.log
