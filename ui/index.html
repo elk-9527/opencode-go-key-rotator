@@ -19,7 +19,7 @@
         <rect x="13.8" y="12.2" width="3" height="3" rx=".65" fill="currentColor" stroke="none"></rect>
       </svg>
       <h1>Key Router</h1>
-      <span id="versionText">v0.4.2</span>
+      <span id="versionText">v0.5.0</span>
     </div>
     <div class="app-actions">
       <button class="toolbar-button" id="detectButton" type="button">
@@ -133,18 +133,46 @@
     </form>
   </dialog>
 
-  <dialog id="extensionDialog">
-    <form method="dialog" class="dialog-panel">
-      <h2>安装 VS Code 扩展</h2>
-      <dl class="dialog-meta">
-        <div><dt>扩展</dt><dd id="extensionName">—</dd></div>
-        <div><dt>发布者</dt><dd id="extensionPublisher">—</dd></div>
-        <div><dt>扩展 ID</dt><dd id="extensionId">—</dd></div>
+  <dialog id="installDialog" class="install-dialog">
+    <form method="dialog" class="dialog-panel install-panel" id="installForm">
+      <header class="install-head">
+        <span class="install-glyph" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><path d="M10 2.5v9m0 0 3.2-3.2M10 11.5 6.8 8.3M4 15.5h12"></path></svg>
+        </span>
+        <div>
+          <span class="official-badge">OFFICIAL</span>
+          <h2 id="installTitle">安装工具</h2>
+        </div>
+      </header>
+
+      <dl class="install-facts">
+        <div><dt>来源</dt><dd id="installPublisher">—</dd></div>
+        <div><dt>标识</dt><dd id="installIdentity">—</dd></div>
       </dl>
-      <p>确认后将调用本机 VS Code 安装；安装结果会再次检测。</p>
+
+      <div class="install-location">
+        <label for="installLocation">安装位置</label>
+        <div class="path-bar">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5h5l1.5 2h8.5v8.5h-15z"></path></svg>
+          <input id="installLocation" type="text" readonly>
+          <button id="chooseInstallLocation" type="button">更改</button>
+        </div>
+        <span id="installPathHint">—</span>
+      </div>
+
+      <p class="install-note" id="installNote">—</p>
+
+      <div class="install-progress" id="installProgress" hidden aria-live="polite">
+        <div class="install-progress-line"><i></i></div>
+        <span id="installProgressText">正在下载安装包…</span>
+      </div>
+
       <div class="dialog-actions">
-        <button class="button secondary" value="cancel">取消</button>
-        <button class="button primary" id="confirmInstall" value="default">安装扩展</button>
+        <button class="button secondary" id="cancelInstall" value="cancel">取消</button>
+        <button class="button primary install-confirm" id="confirmInstall" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v9m0 0 3-3m-3 3L7 9M4 16h12"></path></svg>
+          安装
+        </button>
       </div>
     </form>
   </dialog>

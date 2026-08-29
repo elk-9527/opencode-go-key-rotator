@@ -22,13 +22,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 import webbrowser
 
+import agent_installers
 import rotate_keys as core
 
 
-APP_VERSION = '0.4.2'
+APP_VERSION = '0.5.0'
 MAX_BODY = 32 * 1024
 PREVIEW_TTL_SECONDS = 15 * 60
 MAX_PREVIEW_TOKENS = 128
+INSTALL_TTL_SECONDS = 10 * 60
+MAX_INSTALL_TOKENS = 32
 IDLE_SHUTDOWN_SECONDS = 60 * 60
 
 
@@ -56,6 +59,8 @@ class AppServer(ThreadingHTTPServer):
         self.operation_lock = threading.Lock()
         self.preview_lock = threading.Lock()
         self.preview_tokens: dict[str, tuple[str, float]] = {}
+        self.install_lock = threading.Lock()
+        self.install_tokens: dict[str, tuple[str, str, float]] = {}
         self.last_request_at = time.monotonic()
         self.assets = resource_dir()
 
@@ -96,6 +101,37 @@ class AppServer(ThreadingHTTPServer):
         ]
         for token in expired:
             self.preview_tokens.pop(token, None)
+
+    def make_install_token(self, target_id: str, location: str) -> str:
+        token = secrets.token_urlsafe(28)
+        with self.install_lock:
+            self.install_tokens[token] = (target_id, location, time.monotonic())
+            self._prune_install_tokens()
+            while len(self.install_tokens) > MAX_INSTALL_TOKENS:
+                oldest = min(self.install_tokens, key=lambda item: self.install_tokens[item][2])
+                self.install_tokens.pop(oldest, None)
+        return token
+
+    def consume_install_token(self, token: str, target_id: str) -> str | None:
+        with self.install_lock:
+            self._prune_install_tokens()
+            stored = self.install_tokens.get(token)
+        if not stored or not secrets.compare_digest(stored[0], target_id):
+            return None
+        return stored[1]
+
+    def discard_install_token(self, token: str) -> None:
+        with self.install_lock:
+            self.install_tokens.pop(token, None)
+
+    def _prune_install_tokens(self):
+        now = time.monotonic()
+        expired = [
+            token for token, (_target_id, _location, created) in self.install_tokens.items()
+            if now - created > INSTALL_TTL_SECONDS
+        ]
+        for token in expired:
+            self.install_tokens.pop(token, None)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -149,6 +185,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._rotation(apply=True)
         elif self.path == '/api/install-extension':
             self._install_extension()
+        elif self.path == '/api/pick-install-location':
+            self._pick_install_location()
+        elif self.path == '/api/install-agent':
+            self._install_agent()
         elif self.path == '/api/pick-dsh-config':
             self._pick_dsh_config()
         elif self.path == '/api/shutdown':
@@ -201,6 +241,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     extension = core.EXTENSION_META.get(item_id)
                     extension = ({**extension, 'installed': True, 'version': '1.0.0', 'installable': True}
                                  if extension else None)
+                    installer = None
+                    if extension:
+                        installer = {
+                            'targetId': item_id, 'name': extension['name'], 'publisher': extension['publisher'],
+                            'identity': extension['id'], 'sourceUrl': f"https://marketplace.visualstudio.com/items?itemName={extension['id']}",
+                            'pathMode': 'fixed', 'folderName': '', 'sizeLabel': '由 VS Code 管理',
+                            'note': '扩展安装到当前 VS Code 使用的扩展目录。', 'kind': 'extension',
+                            'installed': True, 'enabled': True, 'location': r'C:\Users\Demo\.vscode\extensions',
+                        }
+                    elif item_id in agent_installers.INSTALLER_META:
+                        installer = agent_installers.public_metadata(item_id, installed=item_id != 'pi')
+                        installer['kind'] = 'agent'
                     candidates = []
                     providers = []
                     selected_provider = ''
@@ -232,6 +284,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         'providers': providers,
                         'selectedProvider': selected_provider,
                         'extension': extension,
+                        'installer': installer,
                     })
                 running = False
             else:
@@ -260,6 +313,78 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
         except Exception as exc:
             self._json({'ok': False, 'error': '扩展安装失败，请重试'}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _pick_install_location(self):
+        try:
+            body = self._read_json()
+            target_id = str(body.get('targetId', '')).strip()
+            if self.server.demo:
+                if target_id not in {*core.EXTENSION_META, *agent_installers.INSTALLER_META}:
+                    raise core.RotationError('该工具不在安装白名单中')
+                location = rf'C:\Users\Demo\Apps\{target_id}'
+                token = self.server.make_install_token(target_id, location)
+                self._json({'ok': True, 'cancelled': False, 'location': location, 'installToken': token})
+                return
+            if target_id in core.EXTENSION_META:
+                instances = core.discover_vscode_installations()
+                if not instances:
+                    raise core.RotationError('没有找到 VS Code，无法安装扩展')
+                roots = core.discover_vscode_extension_dirs(instances)
+                location = str(next((root for root in roots if root.is_dir()), roots[0] if roots else Path(core.VSCODE_EXTENSIONS_DIR)))
+            elif target_id in agent_installers.INSTALLER_META:
+                metadata = agent_installers.INSTALLER_META[target_id]
+                if metadata['pathMode'] == 'fixed':
+                    location = str(agent_installers.resolve_install_location(target_id))
+                else:
+                    selected = pick_install_parent(target_id)
+                    if not selected:
+                        self._json({'ok': True, 'cancelled': True})
+                        return
+                    location = str(agent_installers.resolve_install_location(target_id, selected))
+                    agent_installers.validate_install_location(target_id, location)
+            else:
+                raise core.RotationError('该工具不在安装白名单中')
+            token = self.server.make_install_token(target_id, location)
+            self._json({'ok': True, 'cancelled': False, 'location': location, 'installToken': token})
+        except ValueError as exc:
+            self._json({'ok': False, 'error': str(exc)}, HTTPStatus.BAD_REQUEST)
+        except (core.RotationError, agent_installers.InstallerError) as exc:
+            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
+        except Exception:
+            self._json({'ok': False, 'error': '无法选择安装位置'}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _install_agent(self):
+        try:
+            body = self._read_json()
+            target_id = str(body.get('targetId', '')).strip()
+            install_token = str(body.get('installToken', '')).strip()
+            if self.server.demo:
+                raise core.RotationError('演示模式不会安装工具')
+            location = self.server.consume_install_token(install_token, target_id)
+            if not location:
+                raise core.RotationError('安装确认已失效，请重新选择位置')
+            if not self.server.operation_lock.acquire(blocking=False):
+                raise core.RotationError('已有操作正在进行，请稍候')
+            try:
+                if target_id in core.EXTENSION_META:
+                    installed = core.install_vscode_extension(core.EXTENSION_META[target_id]['id'])
+                    result = {
+                        'targetId': target_id, 'name': installed['name'],
+                        'location': location, 'version': installed['version'],
+                    }
+                else:
+                    result = agent_installers.install_agent(target_id, location, core.APP_SETTINGS)
+                    core.refresh_runtime_paths()
+            finally:
+                self.server.operation_lock.release()
+            self.server.discard_install_token(install_token)
+            self._json({'ok': True, 'installed': result})
+        except ValueError as exc:
+            self._json({'ok': False, 'error': str(exc)}, HTTPStatus.BAD_REQUEST)
+        except (core.RotationError, agent_installers.InstallerError) as exc:
+            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
+        except Exception:
+            self._json({'ok': False, 'error': '安装失败，请检查网络后重试'}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _pick_dsh_config(self):
         try:
@@ -439,6 +564,48 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     if selected and Path(selected).name.lower() != 'settings.yaml':
         raise core.RotationError('请选择名为 settings.yaml 的 DSH 配置文件')
     return selected
+
+
+def pick_install_parent(target_id: str) -> str:
+    """打开本机文件夹选择器；网页只能取得用户明确选择的目录。"""
+    metadata = agent_installers.INSTALLER_META.get(target_id)
+    if not metadata:
+        raise core.RotationError('该工具不在安装白名单中')
+    if os.name != 'nt':
+        raise core.RotationError('一键安装目前仅支持 Windows')
+    title = f"选择 {metadata['name']} 的安装位置"
+    initial = agent_installers.default_parent(target_id)
+    if not initial.is_dir():
+        initial = Path.home()
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = $env:RK_INSTALL_PICKER_TITLE
+$dialog.SelectedPath = $env:RK_INSTALL_PICKER_INITIAL
+$dialog.ShowNewFolderButton = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+  [Console]::Write($dialog.SelectedPath)
+}
+"""
+    powershell = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
+    environment = os.environ.copy()
+    environment['RK_INSTALL_PICKER_TITLE'] = title
+    environment['RK_INSTALL_PICKER_INITIAL'] = str(initial)
+    try:
+        result = subprocess.run(
+            [powershell, '-NoProfile', '-STA', '-Command', script],
+            capture_output=True, timeout=300,
+            env=environment,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise core.RotationError('文件夹选择器等待超时') from exc
+    except OSError as exc:
+        raise core.RotationError('无法打开 Windows 文件夹选择器') from exc
+    if result.returncode != 0:
+        raise core.RotationError('Windows 文件夹选择器运行失败')
+    return result.stdout.decode('utf-8-sig', errors='replace').strip()
 
 
 def app_browser_path() -> Path | None:

@@ -255,16 +255,21 @@ summary:focus-visible {
 .target-row[data-state="unsupported"] .target-state,
 .target-row[data-state="unconfigured"] .target-state { color: var(--warn); }
 .install-mini {
+  min-width: 54px;
   height: 24px;
   margin-top: 4px;
-  padding: 0 8px;
-  color: var(--accent);
-  background: transparent;
+  padding: 0 7px;
+  color: var(--surface);
+  background: var(--accent);
   border: 1px solid var(--accent);
   border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
   cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, transform .08s ease;
 }
-.install-mini:hover { color: var(--surface); background: var(--accent); }
+.install-mini:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.install-mini:active { transform: translateY(1px); }
 .install-mini:disabled { opacity: .45; cursor: default; }
 
 .work-pane {
@@ -417,6 +422,109 @@ dialog::backdrop { background: rgba(0, 0, 0, .48); }
 .dialog-meta dt { color: var(--ink-muted); background: var(--surface-alt); border-right: 1px solid var(--border); }
 .dialog-meta dd { font-family: var(--font-mono); font-size: 10px; }
 
+.install-dialog { width: min(500px, calc(100% - 28px)); }
+.install-panel { padding: 0; overflow: hidden; }
+.install-head {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--border);
+}
+.install-glyph {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 5px;
+}
+.install-glyph svg { width: 20px; height: 20px; stroke-width: 1.7; }
+.install-head h2 { margin-top: 3px; font-size: 16px; }
+.official-badge {
+  display: block;
+  color: var(--accent);
+  font: 600 9px/1 var(--font-mono);
+  letter-spacing: 1.1px;
+}
+.install-facts { margin: 0; padding: 11px 18px 3px; }
+.install-facts div { min-height: 25px; display: grid; grid-template-columns: 62px minmax(0, 1fr); align-items: baseline; }
+.install-facts dt,
+.install-facts dd { margin: 0; }
+.install-facts dt { color: var(--ink-muted); }
+.install-facts dd { overflow-wrap: anywhere; font: 10px/1.45 var(--font-mono); }
+.install-location { padding: 8px 18px 10px; }
+.install-location > label { display: block; margin-bottom: 6px; color: var(--ink-muted); font-size: 11px; }
+.path-bar {
+  height: 34px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.path-bar > svg { justify-self: center; color: var(--accent); }
+.path-bar input {
+  min-width: 0;
+  height: 100%;
+  padding: 0 8px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--border);
+  outline: 0;
+  font: 10px/1 var(--font-mono);
+  text-overflow: ellipsis;
+}
+.path-bar button {
+  height: 100%;
+  padding: 0 11px;
+  color: var(--ink-muted);
+  background: var(--surface-alt);
+  border: 0;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.path-bar button:hover { color: var(--ink); background: var(--surface-hover); }
+.path-bar button[hidden] { display: none; }
+.install-location > span { display: block; margin-top: 5px; color: var(--ink-faint); font-size: 10px; }
+.install-note {
+  margin: 0 18px 14px !important;
+  padding: 8px 10px;
+  color: var(--ink-muted) !important;
+  background: var(--surface-alt);
+  border-left: 2px solid var(--border-strong);
+  font-size: 11px;
+}
+.install-progress { padding: 0 18px 14px; }
+.install-progress-line { height: 2px; overflow: hidden; background: var(--border); }
+.install-progress-line i {
+  display: block;
+  width: 34%;
+  height: 100%;
+  background: var(--accent);
+  transform: translateX(-110%);
+  animation: install-sweep 1.15s ease-in-out infinite;
+}
+.install-progress span { display: block; margin-top: 7px; color: var(--ink-muted); font-size: 11px; }
+.install-progress[data-tone="error"] .install-progress-line i { width: 100%; background: var(--danger); animation: none; transform: none; }
+.install-progress[data-tone="error"] span { color: var(--danger); }
+.install-panel .dialog-actions { padding: 12px 18px 16px; border-top: 1px solid var(--border); }
+.install-confirm { display: inline-flex; align-items: center; gap: 6px; }
+.install-confirm svg { width: 14px; height: 14px; }
+.inspector-install { margin: 10px 16px 14px; }
+
+@keyframes install-sweep {
+  0% { transform: translateX(-110%); }
+  55%, 100% { transform: translateX(305%); }
+}
+
 .toast {
   max-width: calc(100% - 24px);
   padding: 8px 12px;
@@ -465,4 +573,5 @@ dialog::backdrop { background: rgba(0, 0, 0, .48); }
     scroll-behavior: auto !important;
     transition-duration: .01ms !important;
   }
+  .install-progress-line i { animation: none; width: 100%; transform: none; }
 }

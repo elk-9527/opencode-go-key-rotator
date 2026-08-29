@@ -51,7 +51,7 @@ async function main() {
 
     await page.goto(url, {waitUntil: 'networkidle'});
     await page.waitForFunction(() => document.querySelectorAll('.target-row').length === 9);
-    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.4.2 · DEMO') throw new Error('界面版本号不正确');
+    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.5.0 · DEMO') throw new Error('界面版本号不正确');
     if ((await page.locator('.target-row').count()) !== 9) throw new Error('目标数量不正确');
     const dshRow = page.locator('.target-row').filter({hasText: 'dsh'}).first();
     if (!(await dshRow.locator('.target-state').textContent()).includes('已配置')) throw new Error('dsh 配置状态显示错误');
@@ -63,6 +63,15 @@ async function main() {
     await page.locator('[data-theme-choice="system"]').click();
     if (await page.locator('html').getAttribute('data-theme') !== 'system') throw new Error('跟随系统主题切换失败');
 
+    const piRow = page.locator('.target-row').filter({has: page.locator('.target-focus strong', {hasText: /^Pi$/})}).first();
+    await piRow.locator('.install-mini').click();
+    await page.locator('#installDialog').waitFor({state: 'visible'});
+    if (!(await page.locator('#installTitle').textContent()).includes('Pi')) throw new Error('安装弹窗标题错误');
+    if (!(await page.locator('#installIdentity').textContent()).includes('earendil-works/pi')) throw new Error('安装来源标识错误');
+    if (!(await page.locator('#installLocation').inputValue()).includes('Demo')) throw new Error('安装位置没有显示');
+    await page.screenshot({path: path.join(outputDir, 'key-router-install-dialog.png'), fullPage: true});
+    await page.locator('#cancelInstall').click();
+
     await page.locator('#previewButton').click();
     await page.waitForFunction(() => document.querySelectorAll('.change-row').length === 9);
     if (!(await page.locator('#applyButton').isDisabled())) throw new Error('演示模式错误地允许真实应用');
@@ -71,14 +80,14 @@ async function main() {
     if (visibleText.includes('sk-demo-1234567890-example')) throw new Error('页面正文泄露了完整 API Key');
     const wideOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (wideOverflow) throw new Error('宽屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v042.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v050.png'), fullPage: true});
     await page.screenshot({path: path.resolve('docs/key-router-ui.png'), fullPage: true});
 
     await page.setViewportSize({width: 760, height: 900});
     await wait(250);
     const narrowOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (narrowOverflow) throw new Error('窄屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v042-narrow.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v050-narrow.png'), fullPage: true});
     if (consoleProblems.length) throw new Error(`浏览器控制台异常：${consoleProblems.join(' | ')}`);
 
     await page.locator('#quitButton').click();
@@ -86,7 +95,7 @@ async function main() {
       new Promise((resolve) => app.once('exit', resolve)),
       wait(10000).then(() => { throw new Error('退出按钮没有关闭本地服务'); }),
     ]);
-    console.log('UI browser QA: OK (themes, preview, responsive, console, shutdown)');
+    console.log('UI browser QA: OK (themes, installer, preview, responsive, console, shutdown)');
   } finally {
     if (browser) await browser.close();
     if (app.exitCode === null) app.kill();

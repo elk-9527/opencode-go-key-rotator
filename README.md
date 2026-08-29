@@ -6,17 +6,17 @@
 
 ## 支持的工具
 
-| 工具 | 写入位置 |
-|---|---|
-| Hermes | `.env` 与 `config.yaml` |
-| Continue | `~/.continue/config.yaml` |
-| dsh | `~/.dsh/settings.yaml` 与 `.credentials.yaml` |
-| VS Code | Custom Endpoint 与 SecretStorage |
-| OpenCode for Copilot | `opencodego.apiBaseUrl` 与 SecretStorage |
-| DeepSeek for Copilot | `deepseek-copilot.baseUrl` 与 SecretStorage |
-| Xiaomi MiMo for Copilot | `mimo-copilot.baseUrl` 与 SecretStorage |
-| Claude Code | `~/.claude/settings.json` |
-| Pi | `~/.pi/agent/models.json` |
+| 工具 | 写入位置 | 缺失时安装 |
+|---|---|---|
+| Hermes | `.env` 与 `config.yaml` | 可选位置 |
+| Continue | `~/.continue/config.yaml` | 随 VS Code |
+| dsh | `~/.dsh/settings.yaml` 与 `.credentials.yaml` | 可选位置 |
+| VS Code | Custom Endpoint 与 SecretStorage | — |
+| OpenCode for Copilot | `opencodego.apiBaseUrl` 与 SecretStorage | 随 VS Code |
+| DeepSeek for Copilot | `deepseek-copilot.baseUrl` 与 SecretStorage | 随 VS Code |
+| Xiaomi MiMo for Copilot | `mimo-copilot.baseUrl` 与 SecretStorage | 随 VS Code |
+| Claude Code | `~/.claude/settings.json` | 官方固定位置 |
+| Pi | `~/.pi/agent/models.json` | 可选位置 |
 
 ## 使用
 
@@ -26,6 +26,8 @@
 2. 检查自动发现的路径；dsh 可选择配置文件和提供商；
 3. 勾选目标工具并生成预览；
 4. 确认后批量应用。
+
+未安装的工具会显示“安装”按钮。选择位置并确认后，软件只从内置白名单中的官方来源安装，完成后自动重新检测。
 
 VS Code 被选中时，请先完全退出 VS Code。界面支持日间、夜间和跟随系统主题。
 
@@ -49,6 +51,7 @@ VS Code 被选中时，请先完全退出 VS Code。界面支持日间、夜间�
 - 只监听 `127.0.0.1`，校验 Host / Origin，并使用会话令牌与一次性预览令牌；
 - VS Code 的 API Key 写入 Windows 加密的 SecretStorage。
 - 扩展安装接口只接受内置白名单 ID，不能执行任意命令。
+- Agent 安装使用一次性位置令牌；Pi 与独立 Node 运行时会核对官方 SHA-256，ZIP 解压会阻止越界路径。
 
 ## 从源码运行
 

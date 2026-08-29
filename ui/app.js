@@ -11,7 +11,8 @@ const state = {
   changes: [],
   selectedTargetId: '',
   targetOptions: {},
-  pendingExtension: null,
+  pendingInstaller: null,
+  installToken: '',
 };
 
 const VSCODE_TARGETS = new Set(['vscode', 'opencode_copilot', 'deepseek_copilot', 'mimo_copilot']);
@@ -43,10 +44,18 @@ const elements = {
   confirmDialog: $('#confirmDialog'),
   confirmText: $('#confirmText'),
   confirmApply: $('#confirmApply'),
-  extensionDialog: $('#extensionDialog'),
-  extensionName: $('#extensionName'),
-  extensionPublisher: $('#extensionPublisher'),
-  extensionId: $('#extensionId'),
+  installDialog: $('#installDialog'),
+  installForm: $('#installForm'),
+  installTitle: $('#installTitle'),
+  installPublisher: $('#installPublisher'),
+  installIdentity: $('#installIdentity'),
+  installLocation: $('#installLocation'),
+  chooseInstallLocation: $('#chooseInstallLocation'),
+  installPathHint: $('#installPathHint'),
+  installNote: $('#installNote'),
+  installProgress: $('#installProgress'),
+  installProgressText: $('#installProgressText'),
+  cancelInstall: $('#cancelInstall'),
   confirmInstall: $('#confirmInstall'),
   quitButton: $('#quitButton'),
   toast: $('#toast'),
@@ -174,12 +183,15 @@ function refreshButtons() {
     const row = input.closest('.target-row');
     input.disabled = state.busy || row?.dataset.selectable !== 'true';
   });
-  elements.targets.querySelectorAll('.install-mini').forEach((button) => {
+  elements.targets.querySelectorAll('.install-action').forEach((button) => {
     button.disabled = state.busy || button.dataset.installable !== 'true';
   });
   elements.targetInspector.querySelectorAll('select, button').forEach((control) => {
     control.disabled = state.busy || control.dataset.disabled === 'true';
   });
+  elements.confirmInstall.disabled = state.busy || !state.installToken;
+  elements.cancelInstall.disabled = state.busyAction === 'install';
+  elements.chooseInstallLocation.disabled = state.busy;
 }
 
 function setBusy(busy, action = '', label = '处理中') {
@@ -305,6 +317,10 @@ function renderInspector(item) {
     addProperty(properties, '扩展 ID', item.extension.id, {mono: true});
     addProperty(properties, '版本', item.extension.installed ? (item.extension.version || '已安装') : '未安装', {mono: true});
   }
+  if (item.installer && !item.installer.installed && !item.extension) {
+    addProperty(properties, '官方来源', item.installer.publisher);
+    addProperty(properties, '安装标识', item.installer.identity, {mono: true});
+  }
   if (item.note) addProperty(properties, '注意', item.note);
   elements.targetInspector.append(properties);
 
@@ -368,12 +384,13 @@ function renderInspector(item) {
     elements.targetInspector.append(controls);
   }
 
-  if (item.extension && !item.extension.installed) {
-    const install = node('button', 'button secondary inspector-install',
-      item.extension.installable ? '安装此扩展…' : '未找到 VS Code');
+  if (item.installer && !item.installer.installed) {
+    const install = node('button', 'button primary inspector-install install-action',
+      item.installer.enabled ? `安装 ${item.installer.name}…` : '需要先安装 VS Code');
     install.type = 'button';
-    install.dataset.disabled = String(!item.extension.installable);
-    install.addEventListener('click', () => promptExtension(item));
+    install.dataset.disabled = String(!item.installer.enabled);
+    install.dataset.installable = String(Boolean(item.installer.enabled));
+    install.addEventListener('click', () => promptInstaller(item));
     elements.targetInspector.append(install);
   }
 
@@ -430,13 +447,13 @@ function renderTargets(items) {
 
     const end = node('div', 'target-end');
     end.append(node('span', 'target-state', item.badge || (item.selectable ? '可写入' : '不可用')));
-    if (item.extension && !item.extension.installed) {
-      const install = node('button', 'install-mini', '安装');
+    if (item.installer && !item.installer.installed) {
+      const install = node('button', 'install-mini install-action', '↓ 安装');
       install.type = 'button';
-      install.dataset.installable = String(Boolean(item.extension.installable));
-      install.disabled = !item.extension.installable;
-      install.title = item.extension.installable ? `安装 ${item.extension.id}` : '未找到 VS Code';
-      install.addEventListener('click', () => promptExtension(item));
+      install.dataset.installable = String(Boolean(item.installer.enabled));
+      install.disabled = !item.installer.enabled;
+      install.title = item.installer.enabled ? `安装 ${item.installer.name}` : '需要先安装 VS Code';
+      install.addEventListener('click', () => promptInstaller(item));
       end.append(install);
     }
     row.append(input, focus, end);
@@ -483,9 +500,9 @@ async function detect() {
     }
     renderTargets(data.items);
     const selectable = data.items.filter((item) => item.selectable).length;
-    const missingExtensions = data.items.filter((item) => item.extension && !item.extension.installed).length;
-    elements.detectSummary.textContent = missingExtensions
-      ? `${selectable} 可用 · ${missingExtensions} 缺扩展`
+    const missingInstallers = data.items.filter((item) => item.installer && !item.installer.installed).length;
+    elements.detectSummary.textContent = missingInstallers
+      ? `${selectable} 可用 · ${missingInstallers} 可安装`
       : `${selectable} 可用`;
     data.items.forEach((item) => appendLog(`${item.title} · ${item.badge}`, item.selectable ? 'ok' : 'warn'));
     if (data.vscodeRunning) appendLog('VS Code 正在运行；写入相关配置前需要退出。', 'warn');
@@ -531,37 +548,123 @@ async function pickDshConfig() {
   }
 }
 
-function promptExtension(item) {
-  if (!item.extension?.installable || state.busy) return;
-  state.pendingExtension = item.extension;
-  elements.extensionName.textContent = item.extension.name;
-  elements.extensionPublisher.textContent = item.extension.publisher;
-  elements.extensionId.textContent = item.extension.id;
-  elements.extensionDialog.showModal();
+function fillInstallDialog() {
+  const installer = state.pendingInstaller;
+  if (!installer) return;
+  elements.installTitle.textContent = `安装 ${installer.name}`;
+  elements.installPublisher.textContent = installer.publisher;
+  elements.installIdentity.textContent = installer.identity;
+  elements.installLocation.value = installer.location || '';
+  elements.installLocation.title = installer.location || '';
+  elements.chooseInstallLocation.hidden = installer.pathMode === 'fixed';
+  const locationMode = installer.pathMode === 'fixed' ? '官方固定位置' : '自动加入用户 PATH';
+  elements.installPathHint.textContent = `${installer.sizeLabel} · ${locationMode}`;
+  elements.installNote.textContent = installer.note;
+  elements.installProgress.hidden = true;
+  elements.installProgress.removeAttribute('data-tone');
+  elements.installProgressText.textContent = '正在下载安装包…';
+  elements.installForm.removeAttribute('aria-busy');
+  elements.cancelInstall.disabled = false;
+  elements.confirmInstall.disabled = !state.installToken;
+  elements.confirmInstall.lastChild.textContent = '安装';
 }
 
-async function installPendingExtension() {
-  const extension = state.pendingExtension;
-  if (!extension || state.busy) return;
-  setBusy(true, 'install', `正在安装 ${extension.id}`);
-  clearLog();
-  appendLog(`请求 VS Code 安装扩展：${extension.id}`);
+async function requestInstallLocation(installer) {
+  const data = await api('/api/pick-install-location', {
+    method: 'POST',
+    body: JSON.stringify({targetId: installer.targetId}),
+  });
+  if (data.cancelled) return false;
+  installer.location = data.location;
+  state.installToken = data.installToken;
+  return true;
+}
+
+async function promptInstaller(item) {
+  const installer = item.installer;
+  if (!installer?.enabled || installer.installed || state.busy) return;
+  state.pendingInstaller = {...installer, targetId: item.id};
+  state.installToken = '';
+  setBusy(true, 'pick-install', installer.pathMode === 'fixed' ? '正在准备官方安装器' : '等待选择安装位置');
   try {
-    const data = await api('/api/install-extension', {
-      method: 'POST',
-      body: JSON.stringify({extensionId: extension.id}),
-    });
-    appendLog(`安装完成：${data.extension.id}@${data.extension.version}`, 'ok');
-    showToast('扩展安装完成', 'ok');
-    state.pendingExtension = null;
-    state.busy = false;
-    await detect();
+    if (!await requestInstallLocation(state.pendingInstaller)) {
+      state.pendingInstaller = null;
+      setMode('未更改安装状态');
+      return;
+    }
+    fillInstallDialog();
+    elements.installDialog.showModal();
   } catch (error) {
+    state.pendingInstaller = null;
+    state.installToken = '';
     appendLog(error.message, 'error');
     showToast(error.message, 'error');
   } finally {
     state.busy = false;
     state.busyAction = '';
+    setFooter('本地运行');
+    refreshButtons();
+  }
+}
+
+async function repickInstallLocation() {
+  if (!state.pendingInstaller || state.busy || state.pendingInstaller.pathMode === 'fixed') return;
+  elements.chooseInstallLocation.disabled = true;
+  elements.chooseInstallLocation.textContent = '选择中…';
+  try {
+    if (await requestInstallLocation(state.pendingInstaller)) fillInstallDialog();
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    elements.chooseInstallLocation.disabled = false;
+    elements.chooseInstallLocation.textContent = '更改';
+  }
+}
+
+async function installPendingAgent() {
+  const installer = state.pendingInstaller;
+  if (!installer || !state.installToken || state.busy) return;
+  setBusy(true, 'install', `正在安装 ${installer.name}`);
+  clearLog();
+  appendLog(`官方来源：${installer.identity}`);
+  appendLog(`安装位置：${installer.location}`);
+  elements.installForm.setAttribute('aria-busy', 'true');
+  elements.installProgress.hidden = false;
+  elements.installProgressText.textContent = installer.kind === 'extension'
+    ? '正在调用 VS Code 安装扩展…'
+    : '正在下载并验证官方安装包…';
+  elements.confirmInstall.lastChild.textContent = '安装中';
+  elements.confirmInstall.disabled = true;
+  elements.cancelInstall.disabled = true;
+  elements.chooseInstallLocation.disabled = true;
+  try {
+    const data = await api('/api/install-agent', {
+      method: 'POST',
+      body: JSON.stringify({targetId: installer.targetId, installToken: state.installToken}),
+    });
+    appendLog(`安装完成：${data.installed.name} ${data.installed.version}`, 'ok');
+    appendLog(`位置：${data.installed.location}`, 'ok');
+    showToast(`${data.installed.name} 安装完成`, 'ok');
+    state.pendingInstaller = null;
+    state.installToken = '';
+    elements.installDialog.close();
+    state.busy = false;
+    state.busyAction = '';
+    await detect();
+  } catch (error) {
+    appendLog(error.message, 'error');
+    elements.logDetails.open = true;
+    elements.installProgressText.textContent = error.message;
+    elements.installProgress.dataset.tone = 'error';
+    elements.installNote.textContent = '安装未完成。可以检查网络后重试，已安装的其他工具不会受影响。';
+    showToast(error.message, 'error');
+  } finally {
+    state.busy = false;
+    state.busyAction = '';
+    elements.installForm.removeAttribute('aria-busy');
+    elements.confirmInstall.lastChild.textContent = '重试';
+    elements.cancelInstall.disabled = false;
+    elements.chooseInstallLocation.disabled = false;
     setFooter('本地运行');
     refreshButtons();
   }
@@ -653,10 +756,16 @@ elements.confirmApply.addEventListener('click', (event) => {
   elements.confirmDialog.close();
   rotate(true);
 });
-elements.confirmInstall.addEventListener('click', (event) => {
-  event.preventDefault();
-  elements.extensionDialog.close();
-  installPendingExtension();
+elements.chooseInstallLocation.addEventListener('click', repickInstallLocation);
+elements.confirmInstall.addEventListener('click', installPendingAgent);
+elements.installDialog.addEventListener('cancel', (event) => {
+  if (state.busyAction === 'install') event.preventDefault();
+});
+elements.installDialog.addEventListener('close', () => {
+  if (state.busyAction === 'install') return;
+  state.pendingInstaller = null;
+  state.installToken = '';
+  elements.installProgress.removeAttribute('data-tone');
 });
 elements.quitButton.addEventListener('click', async () => {
   try { await api('/api/shutdown', {method: 'POST', body: '{}'}); } catch (_) { /* 服务可能先关闭 */ }

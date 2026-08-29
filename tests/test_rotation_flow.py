@@ -217,6 +217,10 @@ agent-default-model:
         self.assertIn("Claude Code", rendered)
         self.assertIn("Pi", rendered)
         self.assertIn("ltmoerdani.opencode-copilot-chat", rendered)
+        indexed = {item["id"]: item for item in items}
+        self.assertEqual(indexed["pi"]["installer"]["identity"], "earendil-works/pi")
+        self.assertEqual(indexed["continue"]["installer"]["kind"], "extension")
+        self.assertEqual(indexed["claude"]["installer"]["pathMode"], "fixed")
 
     def test_dry_run_is_read_only_and_logs_are_masked(self):
         tracked = list(self.paths.values())

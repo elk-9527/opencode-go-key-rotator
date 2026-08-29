@@ -26,6 +26,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import agent_installers
+
 
 class RotationError(RuntimeError):
     """可安全展示给界面的错误。"""
@@ -65,6 +67,13 @@ def _paths() -> dict[str, str]:
 
 PATHS = _paths()
 globals().update(PATHS)
+
+
+def refresh_runtime_paths() -> None:
+    """安装器更新环境变量后，重新解析当前进程使用的配置路径。"""
+    global PATHS
+    PATHS = _paths()
+    globals().update(PATHS)
 
 TARGET_ORDER = (
     "hermes", "continue", "dsh", "vscode",
@@ -320,16 +329,24 @@ def _command_discovery(commands: tuple[str, ...], label: str = "PATH 命令") ->
 
 def discover_hermes_installations() -> list[dict]:
     items = _command_discovery(("hermes", "hermes.cmd", "hermes.exe"))
+    items.extend(agent_installers.managed_discovery(APP_SETTINGS, "hermes"))
     items.extend(_shortcut_targets(r"^Hermes(?: Agent| Desktop)?$"))
     return _dedupe_discovery(items)
 
 
 def discover_claude_installations() -> list[dict]:
-    return _command_discovery(("claude", "claude.cmd", "claude.exe"))
+    items = _command_discovery(("claude", "claude.cmd", "claude.exe"))
+    native = Path.home() / ".local" / "bin" / "claude.exe"
+    if native.is_file():
+        items.append({"path": str(native), "source": "Claude 官方位置"})
+    items.extend(agent_installers.managed_discovery(APP_SETTINGS, "claude"))
+    return _dedupe_discovery(items)
 
 
 def discover_pi_installations() -> list[dict]:
-    return _command_discovery(("pi", "pi.cmd", "pi.exe"))
+    items = _command_discovery(("pi", "pi.cmd", "pi.exe"))
+    items.extend(agent_installers.managed_discovery(APP_SETTINGS, "pi"))
+    return _dedupe_discovery(items)
 
 
 def discover_dsh_installations() -> list[dict]:
@@ -353,6 +370,7 @@ def discover_dsh_installations() -> list[dict]:
     items.extend(_registry_app_paths("DSH Desktop.exe"))
     items.extend(_registry_uninstall_matches(r"\bDSH\b|DeepSeek Harness"))
     items.extend(_shortcut_targets(r"(^|\s)DSH( Desktop)?($|\s)|DeepSeek Harness"))
+    items.extend(agent_installers.managed_discovery(APP_SETTINGS, "dsh"))
     return _dedupe_discovery(items)
 
 
@@ -1396,15 +1414,54 @@ def detect_targets(target_options: dict | None = None) -> list[dict]:
     options = target_options if isinstance(target_options, dict) else {}
     vscode_instances = discover_vscode_installations()
     extension_versions = installed_vscode_extensions(vscode_instances)
-    return [
-        _state(
+    rows = []
+    for target_id in TARGET_ORDER:
+        row = _state(
             target_id,
             options.get(target_id),
             extension_versions=extension_versions,
             vscode_instances=vscode_instances,
         ).public()
-        for target_id in TARGET_ORDER
-    ]
+        if target_id in EXTENSION_META:
+            extension = row.get("extension") or extension_public(target_id, extension_versions, vscode_instances)
+            roots = discover_vscode_extension_dirs(vscode_instances)
+            location = str(next((root for root in roots if root.is_dir()), roots[0] if roots else Path(VSCODE_EXTENSIONS_DIR)))
+            row["installer"] = {
+                "targetId": target_id,
+                "name": extension["name"],
+                "publisher": extension["publisher"],
+                "identity": extension["id"],
+                "sourceUrl": f"https://marketplace.visualstudio.com/items?itemName={extension['id']}",
+                "pathMode": "fixed",
+                "folderName": "",
+                "sizeLabel": "由 VS Code 管理",
+                "note": "扩展安装到当前 VS Code 使用的扩展目录。",
+                "kind": "extension",
+                "installed": bool(extension["installed"]),
+                "enabled": bool(extension["installable"]),
+                "location": location,
+            }
+        elif target_id in agent_installers.INSTALLER_META:
+            discoveries = {
+                "hermes": discover_hermes_installations,
+                "dsh": discover_dsh_installations,
+                "claude": discover_claude_installations,
+                "pi": discover_pi_installations,
+            }[target_id]()
+            records = agent_installers.load_install_records(APP_SETTINGS)
+            record = records.get(target_id, {}) if isinstance(records, dict) else {}
+            location = str(record.get("location") or "") if isinstance(record, dict) else ""
+            installer = agent_installers.public_metadata(
+                target_id,
+                installed=bool(discoveries),
+                location=location,
+            )
+            installer["kind"] = "agent"
+            row["installer"] = installer
+        else:
+            row["installer"] = None
+        rows.append(row)
+    return rows
 
 
 def _plan_hermes(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:

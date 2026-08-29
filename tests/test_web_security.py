@@ -94,6 +94,13 @@ class WebSecurityTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_install_location_tokens_are_target_bound_and_revocable(self):
+        token = self.server.make_install_token("pi", r"C:\Tools\Pi")
+        self.assertIsNone(self.server.consume_install_token(token, "claude"))
+        self.assertEqual(self.server.consume_install_token(token, "pi"), r"C:\Tools\Pi")
+        self.server.discard_install_token(token)
+        self.assertIsNone(self.server.consume_install_token(token, "pi"))
+
     def test_rejects_oversized_and_chunked_requests(self):
         token = self.session_token()
         status, _payload = self.request(
