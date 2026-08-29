@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
+  <style>
+    .tile{fill:#fbfaf7}.node{fill:#f0ddd1;stroke:#a14f2a}.route{stroke:#a14f2a}
+    @media (prefers-color-scheme:dark){.tile{fill:#201d1a}.node{fill:#492d20;stroke:#d97948}.route{stroke:#d97948}}
+  </style>
+  <rect class="tile" x="2" y="2" width="60" height="60" rx="10"/>
+  <rect class="node" x="12" y="14" width="19" height="13" rx="1" stroke-width="3"/>
+  <rect class="node" x="35" y="37" width="17" height="13" rx="1" stroke-width="3"/>
+  <path class="route" d="M31 20.5h4c10 0 10 23 0 23h-4M12 43.5h10" fill="none" stroke-width="3" stroke-linecap="square"/>
+</svg>

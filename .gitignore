@@ -1,5 +1,11 @@
-backups/
-test_env/
 __pycache__/
-*.pyc
-*.log
+*.py[cod]
+.pytest_cache/
+.build-venv/
+.playwright-cli/
+backups/
+build/
+dist/
+output/
+test_env/
+*.spec.bak

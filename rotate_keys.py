@@ -1,414 +1,838 @@
 # -*- coding: utf-8 -*-
+"""Key Router 核心：把一组 Base URL + API Key 安全写入多个 AI 工具。
+
+默认只预览；正式写入前备份全部目标文件。每个适配器只修改明确字段，
+不全盘搜索或替换疑似密钥的字符串。日志与返回值均不包含完整密钥。
 """
-OpenCode Go key rotator — 一次性替换所有 agent 的 opencode.go API key
+from __future__ import annotations
 
-覆盖:
-  1. Hermes           -> E:\\Program Files\\Hermes\\.env  (OPENCODE_GO_API_KEY)
-  2. Continue 插件     -> ~/.continue/config.yaml        (apiKey)
-  3. dsh              -> ~/.dsh/.credentials.yaml        (refs.DEEPSEEK_API_KEY)
-  4. VS Code          -> state.vscdb (SecretStorage 加密条目 + 指纹/模型配置明文)
-                         chatLanguageModels.json (模型设置键名内嵌指纹)
-  5. (可选) opencode CLI -> auth.json 中的 opencode-go 条目删除
-
-用法:
-  python rotate_keys.py --detect               # 只检测当前各位置 key 状态
-  python rotate_keys.py <新key> --dry-run       # 预览（默认，不写文件）
-  python rotate_keys.py <新key> --apply         # 执行替换
-  python rotate_keys.py <新key> --apply --delete-opencode-auth   # 顺带删除 opencode CLI 旧 key
-
-安全设计:
-  - 默认 dry-run，--apply 才真改
-  - 改前自动备份全部文件到 backups/ 目录
-  - 全程不打印完整 key（只显示前8+后4）
-  - state.vscdb 写入前要求 VS Code 已关闭（文件锁/WAL 保护）
-  - 只替换 == 旧 key 的 secret 条目；其它 key（如 DeepSeek/小米）不碰
-"""
 import argparse
 import base64
-import copy
+import ctypes
+import ctypes.wintypes as wt
+from dataclasses import dataclass, field
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import sqlite3
-import sys
+import tempfile
 import time
-import ctypes
-import ctypes.wintypes as wt
+from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
-# ─── 依赖 cryptography（仅用 AESGCM）──────────────────────────────
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:
-    sys.exit('[!] 需要 cryptography 库：pip install cryptography')
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-# ─── 配置区（Windows 默认路径；可用环境变量 RK_PATHS_JSON 覆盖，用于测试）────────────────
-def _paths() -> dict:
-    appdata = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming')
-    home = os.path.expanduser('~')
-    p = {
-        'HERMES_ENV': r'E:\Program Files\Hermes\.env',
-        'CONTINUE_CONFIG': os.path.join(home, '.continue', 'config.yaml'),
-        'DSH_CREDENTIALS': os.path.join(home, '.dsh', '.credentials.yaml'),
-        'VSCODE_STATE_DB': os.path.join(appdata, 'Code', 'User', 'globalStorage', 'state.vscdb'),
-        'VSCODE_LOCAL_STATE': os.path.join(appdata, 'Code', 'Local State'),
-        'CHAT_LM_JSON': os.path.join(appdata, 'Code', 'User', 'chatLanguageModels.json'),
-        'OPENCODE_AUTH': os.path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+class RotationError(RuntimeError):
+    """可安全展示给界面的错误。"""
+
+
+def _paths() -> dict[str, str]:
+    home = Path.home()
+    appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+    hermes_home = Path(os.environ.get("HERMES_HOME") or r"E:\Program Files\Hermes")
+    paths = {
+        "HERMES_ENV": str(hermes_home / ".env"),
+        "HERMES_CONFIG": str(hermes_home / "config.yaml"),
+        "CONTINUE_CONFIG": str(home / ".continue" / "config.yaml"),
+        "DSH_SETTINGS": str(home / ".dsh" / "settings.yaml"),
+        "DSH_CREDENTIALS": str(home / ".dsh" / ".credentials.yaml"),
+        "VSCODE_STATE_DB": str(appdata / "Code" / "User" / "globalStorage" / "state.vscdb"),
+        "VSCODE_LOCAL_STATE": str(appdata / "Code" / "Local State"),
+        "CHAT_LM_JSON": str(appdata / "Code" / "User" / "chatLanguageModels.json"),
+        "CLAUDE_SETTINGS": str(home / ".claude" / "settings.json"),
+        "PI_SETTINGS": str(home / ".pi" / "agent" / "settings.json"),
+        "PI_MODELS": str(home / ".pi" / "agent" / "models.json"),
+        "BACKUP_DIR": str(Path(__file__).resolve().parent / "backups"),
     }
-    ov = os.environ.get('RK_PATHS_JSON')
-    if ov:
-        p.update(json.loads(ov))
-    return p
+    override = os.environ.get("RK_PATHS_JSON")
+    if override:
+        paths.update({key: str(value) for key, value in json.loads(override).items()})
+    return paths
 
 
 PATHS = _paths()
-HERMES_ENV = PATHS['HERMES_ENV']
-CONTINUE_CONFIG = PATHS['CONTINUE_CONFIG']
-DSH_CREDENTIALS = PATHS['DSH_CREDENTIALS']
-VSCODE_STATE_DB = PATHS['VSCODE_STATE_DB']
-VSCODE_LOCAL_STATE = PATHS['VSCODE_LOCAL_STATE']
-CHAT_LM_JSON = PATHS['CHAT_LM_JSON']
-OPENCODE_AUTH = PATHS['OPENCODE_AUTH']
+globals().update(PATHS)
 
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backups')
+TARGET_ORDER = ("hermes", "continue", "dsh", "vscode", "claude", "pi")
+TARGET_META = {
+    "hermes": ("Hermes", "config.yaml + .env"),
+    "continue": ("Continue", "~/.continue/config.yaml"),
+    "dsh": ("dsh", "~/.dsh/settings.yaml"),
+    "vscode": ("VS Code", "Custom Endpoint + SecretStorage"),
+    "claude": ("Claude Code", "~/.claude/settings.json"),
+    "pi": ("Pi", "~/.pi/agent/models.json"),
+}
 
-VSCode_SECRET_KEYS = [
-    'secret://{"extensionId":"ltmoerdani.opencode-copilot-chat","key":"opencodego.apiKey"}',
-]
-
-VSCode_SECRET_PREFIX = 'secret://chat.lm.secret.'
+VSCODE_SECRET_ID = "chat.lm.secret.key-router-api-key"
+VSCODE_SECRET_KEY = f"secret://{VSCODE_SECRET_ID}"
+VSCODE_SECRET_REF = "${input:" + VSCODE_SECRET_ID + "}"
 
 
-def list_vscode_lm_secret_keys(db: sqlite3.Connection) -> list[str]:
-    """动态发现 chat.lm.secret.* 条目（各机器 id 不同）"""
-    cur = db.cursor()
-    cur.execute("SELECT key FROM ItemTable WHERE key LIKE ?", (VSCode_SECRET_PREFIX + '%',))
-    return [r[0] for r in cur.fetchall()]
+@dataclass
+class TargetState:
+    id: str
+    title: str
+    location: str
+    state: str
+    badge: str
+    detail: str
+    selectable: bool
+    current_url: str | None = None
+    current_key: str | None = None
+    note: str = ""
 
-# ─── DPAPI ────────────────────────────────────────────────────────
+    def public(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "location": self.location,
+            "state": self.state,
+            "badge": self.badge,
+            "detail": self.detail,
+            "selectable": self.selectable,
+            "note": self.note,
+        }
+
+
+@dataclass
+class Change:
+    target_id: str
+    path: str
+    summary: str
+    after_text: str | None = None
+    action: Callable[[], None] | None = None
+
+    def apply(self):
+        if self.action:
+            self.action()
+        elif self.after_text is not None:
+            _atomic_write_text(self.path, self.after_text)
+
+
+@dataclass
+class TargetPlan:
+    target: TargetState
+    changes: list[Change] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
 class DATA_BLOB(ctypes.Structure):
-    _fields_ = [('cbData', wt.DWORD), ('pbData', ctypes.POINTER(ctypes.c_byte))]
+    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
 
 
 def dpapi_decrypt(blob: bytes) -> bytes:
-    d = DATA_BLOB(len(blob), ctypes.cast(ctypes.create_string_buffer(blob), ctypes.POINTER(ctypes.c_byte)))
-    out = DATA_BLOB()
-    if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(d), None, None, None, None, 0, ctypes.byref(out)):
-        raise OSError(f'CryptUnprotectData failed, err={ctypes.windll.kernel32.GetLastError():#x}')
-    b = ctypes.string_at(out.pbData, out.cbData)
-    ctypes.windll.kernel32.LocalFree(out.pbData)
-    return b
+    source = DATA_BLOB(
+        len(blob), ctypes.cast(ctypes.create_string_buffer(blob), ctypes.POINTER(ctypes.c_byte))
+    )
+    output = DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(source), None, None, None, None, 0, ctypes.byref(output)
+    )
+    if not ok:
+        raise OSError("无法解密 VS Code 本机密钥")
+    try:
+        return ctypes.string_at(output.pbData, output.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(output.pbData)
 
 
 def get_vscode_aes_key() -> bytes:
-    """从 VS Code Local State 取 DPAPI 保护的 AES key（Chromium os_crypt）"""
-    ls = json.load(open(VSCODE_LOCAL_STATE, encoding='utf-8'))
-    enc = base64.b64decode(ls['os_crypt']['encrypted_key'])
-    assert enc.startswith(b'DPAPI'), 'Local State encrypted_key 不是 DPAPI 格式'
-    raw = dpapi_decrypt(enc[5:])
+    with open(VSCODE_LOCAL_STATE, encoding="utf-8") as file:
+        local_state = json.load(file)
+    encrypted = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+    if not encrypted.startswith(b"DPAPI"):
+        raise RotationError("VS Code Local State 不是受支持的 DPAPI 格式")
+    raw = dpapi_decrypt(encrypted[5:])
     return raw if len(raw) == 32 else base64.b64decode(raw)
 
 
-def vscode_secret_decrypt(v10_value: bytes, aes_key: bytes) -> str:
-    assert v10_value.startswith(b'v10'), '非 v10 格式'
-    blob = v10_value[3:]
-    return AESGCM(aes_key).decrypt(blob[:12], blob[12:], None).decode('utf-8')
+def vscode_secret_decrypt(value: bytes, aes_key: bytes) -> str:
+    if not value.startswith(b"v10"):
+        raise RotationError("VS Code SecretStorage 格式不受支持")
+    blob = value[3:]
+    return AESGCM(aes_key).decrypt(blob[:12], blob[12:], None).decode("utf-8")
 
 
-def vscode_secret_encrypt(plain: str, aes_key: bytes) -> bytes:
+def vscode_secret_encrypt(value: str, aes_key: bytes) -> bytes:
     nonce = os.urandom(12)
-    return b'v10' + nonce + AESGCM(aes_key).encrypt(nonce, plain.encode('utf-8'), None)
+    return b"v10" + nonce + AESGCM(aes_key).encrypt(nonce, value.encode("utf-8"), None)
 
 
-def mask(s: str) -> str:
-    if not s:
-        return '(空)'
-    return f'{s[:8]}...{s[-4:]}({len(s)})' if len(s) > 12 else s
+def mask(value: str | None) -> str:
+    if not value:
+        return "未设置"
+    if len(value) <= 8:
+        return "•" * len(value)
+    return f"{value[:4]}…{value[-4:]} ({len(value)})"
 
 
-def fingerprint_of(key: str) -> str:
-    """扩展的指纹算法: 前8位-后8位"""
-    return f'{key[:8]}-{key[-8:]}'
+def validate_key(value: str) -> str:
+    key = value.strip()
+    if not 4 <= len(key) <= 2048:
+        raise RotationError("API Key 长度应为 4–2048 个字符")
+    if any(character.isspace() or ord(character) < 32 for character in key):
+        raise RotationError("API Key 不能包含空格、换行或控制字符")
+    return key
 
 
-# ─── 读取各处 key ─────────────────────────────────────────────────
-def read_key_from_env(path: str, var: str) -> str | None:
-    if not os.path.isfile(path):
-        return None
-    t = open(path, encoding='utf-8', errors='ignore').read()
-    m = re.search(rf'^{var}=(\S+)', t, re.M)
-    return m.group(1) if m else None
-
-
-def read_key_from_yaml(path: str, field: str) -> str | None:
-    """匹配 <field>: <value>（YAML 缩进也兼容）"""
-    if not os.path.isfile(path):
-        return None
-    t = open(path, encoding='utf-8', errors='ignore').read()
-    m = re.search(rf'^\s*{re.escape(field)}:\s*"([^"]+)"\s*$', t, re.M) or \
-        re.search(rf'^\s*{re.escape(field)}:\s*\'([^\']+)\'\s*$', t, re.M) or \
-        re.search(rf'^\s*{re.escape(field)}:\s*(\S+)\s*$', t, re.M)
-    return m.group(1) if m else None
-
-
-def read_vscode_secrets(aes_key: bytes) -> dict:
-    out = {}
-    db = sqlite3.connect(f'file:{VSCODE_STATE_DB}?mode=ro', uri=True)
+def validate_base_url(value: str) -> str:
+    raw = value.strip()
+    if not raw or len(raw) > 2048:
+        raise RotationError("Base URL 不能为空或过长")
     try:
-        cur = db.cursor()
-        for sk in VSCode_SECRET_KEYS + list_vscode_lm_secret_keys(db):
+        parsed = urlsplit(raw)
+    except ValueError as exc:
+        raise RotationError("Base URL 格式不正确") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RotationError("Base URL 必须是完整的 http:// 或 https:// 地址")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RotationError("Base URL 不能包含账号、密码、查询参数或锚点")
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "http" and parsed.hostname.lower() not in local_hosts:
+        raise RotationError("远程地址必须使用 HTTPS；HTTP 仅允许本机地址")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="strict", newline="") as file:
+        return file.read()
+
+
+def _atomic_write_text(path: str, text: str):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = target.stat().st_mode if target.exists() else None
+    handle, temp_path = tempfile.mkstemp(prefix=f".{target.name}.key-router-", dir=target.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        if mode is not None:
+            os.chmod(temp_path, mode)
+        os.replace(temp_path, target)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _json_dump(data) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def _load_json(path: str, default):
+    if not os.path.isfile(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RotationError(f"配置文件无法解析：{Path(path).name}") from exc
+
+
+def _strip_jsonc(text: str) -> str:
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+        elif char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+        elif char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            index += 2
+            while index + 1 < len(text) and text[index:index + 2] != "*/":
+                index += 1
+            index += 2
+        else:
+            output.append(char)
+            index += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(output))
+
+
+def _load_jsonc(path: str, default):
+    if not os.path.isfile(path):
+        return default
+    try:
+        return json.loads(_strip_jsonc(_read_text(path)))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RotationError(f"配置文件无法解析：{Path(path).name}") from exc
+
+
+def _unquote_yaml(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or value in {"null", "~"}:
+        return None
+    if value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+        if value[0] == '"':
             try:
-                cur.execute('SELECT value FROM ItemTable WHERE key=?', (sk,))
-                r = cur.fetchone()
-                if r:
-                    out[sk] = vscode_secret_decrypt(bytes(json.loads(r[0])['data']), aes_key)
-            except Exception as e:
-                out[sk] = f'ERR:{e}'
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        return value[1:-1].replace("''", "'")
+    return value.split(" #", 1)[0].strip()
+
+
+def _yaml_entries(text: str):
+    stack: list[tuple[int, str]] = []
+    for index, line in enumerate(text.splitlines(keepends=True)):
+        match = re.match(r"^( *)([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*?))?\s*(?:\r?\n)?$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        key = match.group(2)
+        path = tuple(item[1] for item in stack) + (key,)
+        raw = match.group(3) or ""
+        yield index, indent, path, raw
+        if not raw.strip():
+            stack.append((indent, key))
+
+
+def _yaml_get(text: str, path: tuple[str, ...]) -> str | None:
+    for _index, _indent, current, raw in _yaml_entries(text):
+        if current == path:
+            return _unquote_yaml(raw)
+    return None
+
+
+def _yaml_child_keys(text: str, path: tuple[str, ...]) -> list[str]:
+    keys = []
+    for _index, _indent, current, _raw in _yaml_entries(text):
+        if len(current) == len(path) + 1 and current[:-1] == path:
+            keys.append(current[-1])
+    return keys
+
+
+def _yaml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _yaml_set(text: str, path: tuple[str, ...], value: str) -> str:
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    entries = list(_yaml_entries(text))
+    for index, indent, current, _raw in entries:
+        if current == path:
+            lines[index] = f"{' ' * indent}{path[-1]}: {_yaml_quote(value)}{newline}"
+            return "".join(lines)
+    parent = path[:-1]
+    parent_entry = next((entry for entry in entries if entry[2] == parent), None)
+    if parent_entry:
+        parent_index, parent_indent, _current, _raw = parent_entry
+        insert_at = len(lines)
+        for index in range(parent_index + 1, len(lines)):
+            stripped = lines[index].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(lines[index]) - len(lines[index].lstrip(" "))
+            if indent <= parent_indent:
+                insert_at = index
+                break
+        lines.insert(insert_at, f"{' ' * (parent_indent + 2)}{path[-1]}: {_yaml_quote(value)}{newline}")
+        return "".join(lines)
+    if len(path) == 2:
+        prefix = "" if not text or text.endswith(("\n", "\r")) else newline
+        return text + prefix + f"{path[0]}:{newline}  {path[1]}: {_yaml_quote(value)}{newline}"
+    raise RotationError(f"配置缺少字段：{'.'.join(parent)}")
+
+
+def _env_get(text: str, name: str) -> str | None:
+    match = re.search(rf"^\s*{re.escape(name)}\s*=\s*(.*?)\s*$", text, re.M)
+    return match.group(1).strip("\"'") if match else None
+
+
+def _env_set(text: str, name: str, value: str) -> str:
+    newline = "\r\n" if "\r\n" in text else "\n"
+    replacement = f"{name}={value}"
+    pattern = re.compile(rf"^\s*{re.escape(name)}\s*=.*$", re.M)
+    if pattern.search(text):
+        return pattern.sub(replacement, text, count=1)
+    prefix = "" if not text or text.endswith(("\n", "\r")) else newline
+    return text + prefix + replacement + newline
+
+
+def _continue_block(text: str):
+    lines = text.splitlines(keepends=True)
+    models_index = next(
+        (index for index, line in enumerate(lines) if re.match(r"^\s*models:\s*(?:#.*)?$", line.rstrip("\r\n"))),
+        None,
+    )
+    if models_index is None:
+        return None
+    models_indent = len(lines[models_index]) - len(lines[models_index].lstrip(" "))
+    candidates = []
+    for index in range(models_index + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= models_indent:
+            break
+        if re.match(r"^\s*-\s+", line):
+            candidates.append((index, indent))
+    if not candidates:
+        return None
+    blocks = []
+    for position, (start, item_indent) in enumerate(candidates):
+        end = candidates[position + 1][0] if position + 1 < len(candidates) else len(lines)
+        for index in range(start + 1, end):
+            if not lines[index].strip() or lines[index].lstrip().startswith("#"):
+                continue
+            indent = len(lines[index]) - len(lines[index].lstrip(" "))
+            if indent <= models_indent:
+                end = index
+                break
+        body = "".join(lines[start:end])
+        score = int(bool(re.search(r"^\s*apiBase:\s*", body, re.M))) + int(bool(re.search(r"^\s*apiKey:\s*", body, re.M)))
+        blocks.append((score, start, end, item_indent))
+    return max(blocks, key=lambda item: item[0])
+
+
+def _continue_values(text: str) -> tuple[str | None, str | None]:
+    block = _continue_block(text)
+    if not block:
+        return None, None
+    _score, start, end, _indent = block
+    body = "".join(text.splitlines(keepends=True)[start:end])
+    def get(field_name):
+        match = re.search(rf"^\s*{field_name}:\s*(.*?)\s*$", body, re.M)
+        return _unquote_yaml(match.group(1)) if match else None
+    return get("apiBase"), get("apiKey")
+
+
+def _continue_set(text: str, base_url: str, api_key: str) -> str:
+    block = _continue_block(text)
+    if not block:
+        raise RotationError("Continue 没有可更新的 models 配置")
+    _score, start, end, item_indent = block
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    field_indent = item_indent + 2
+    for field_name, value in (("apiBase", base_url), ("apiKey", api_key)):
+        found = None
+        for index in range(start, end):
+            if re.match(rf"^\s*{field_name}:\s*", lines[index]):
+                found = index
+                break
+        new_line = f"{' ' * field_indent}{field_name}: {_yaml_quote(value)}{newline}"
+        if found is not None:
+            lines[found] = new_line
+        else:
+            lines.insert(end, new_line)
+            end += 1
+    return "".join(lines)
+
+
+def _vscode_read_secret() -> str | None:
+    if not os.path.isfile(VSCODE_STATE_DB) or not os.path.isfile(VSCODE_LOCAL_STATE):
+        return None
+    aes_key = get_vscode_aes_key()
+    db = sqlite3.connect(f"file:{VSCODE_STATE_DB}?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT value FROM ItemTable WHERE key=?", (VSCODE_SECRET_KEY,)).fetchone()
     finally:
         db.close()
-    return out
+    if not row:
+        return None
+    payload = json.loads(row[0])
+    return vscode_secret_decrypt(bytes(payload["data"]), aes_key)
 
 
-def detect() -> dict:
-    """返回 {位置: key 或 错误说明}"""
-    result = {}
-    result['Hermes .env'] = read_key_from_env(HERMES_ENV, 'OPENCODE_GO_API_KEY')
-    result['Continue config.yaml'] = read_key_from_yaml(CONTINUE_CONFIG, 'apiKey')
-    result['dsh .credentials.yaml'] = read_key_from_yaml(DSH_CREDENTIALS, 'DEEPSEEK_API_KEY')
-    try:
-        aes = get_vscode_aes_key()
-        sec = read_vscode_secrets(aes)
-        for k, v in sec.items():
-            result[f'VS Code secret ({k.split(".")[-1][:12]}...)'] = v
-    except Exception as e:
-        result['VS Code secrets'] = f'ERR:{e}'
-    return result
-
-
-# ─── 备份 ─────────────────────────────────────────────────────────
-def backup(files: list[str]) -> str:
-    ts = time.strftime('%Y%m%d-%H%M%S')
-    bdir = os.path.join(BACKUP_DIR, ts)
-    os.makedirs(bdir, exist_ok=True)
-    for f in files:
-        if os.path.isfile(f):
-            shutil.copy2(f, os.path.join(bdir, os.path.basename(f)))
-    return bdir
-
-
-# ─── 替换执行 ─────────────────────────────────────────────────────
-def replace_in_file(path: str, pairs: list[tuple[str, str]], apply: bool = False) -> list[str]:
-    """文件内字符串替换；返回修改的描述。文件不存在则跳过。apply=False 只预览。"""
-    if not os.path.isfile(path):
-        return [f'[跳过] {path} 不存在']
-    t = open(path, encoding='utf-8', errors='ignore').read()
-    changed = []
-    for old, new in pairs:
-        if old and old in t:
-            n = t.count(old)
-            t = t.replace(old, new)
-            changed.append(f'  替换 {mask(old)} -> {mask(new)} x{n} ({os.path.basename(path)})')
-    if changed and apply:
-        open(path, 'w', encoding='utf-8', newline='').write(t)
-    return changed or [f'[无变化] {path}']
-
-
-def replace_vscode_db(old_key: str, new_key: str, aes_key: bytes, ref_keys: set, apply: bool) -> list[str]:
-    """state.vscdb：secret 重加密 + 全表字符串替换
-
-    ref_keys: 明文配置（.env/Continue/dsh）里读到的 key 集合，用于判断 chat.lm.secret.* 是否属于 opencode
-    重加密规则:
-      - ltmoerdani 扩展的 opencodego.apiKey: 无条件（该键专存 opencode key）
-      - chat.lm.secret.*: 解密值 ∈ ref_keys 才换（避免误伤 Custom Endpoint 等其他 key）
-    """
-    msgs = []
+def _vscode_write_secret(api_key: str):
+    aes_key = get_vscode_aes_key()
+    payload = json.dumps({"type": "Buffer", "data": list(vscode_secret_encrypt(api_key, aes_key))})
     db = sqlite3.connect(VSCODE_STATE_DB)
     try:
-        cur = db.cursor()
-        EXT_KEY = 'secret://{"extensionId":"ltmoerdani.opencode-copilot-chat","key":"opencodego.apiKey"}'
-        # 1) 扩展专用键：无条件重加密
-        cur.execute('SELECT value FROM ItemTable WHERE key=?', (EXT_KEY,))
-        r = cur.fetchone()
-        if r:
-            try:
-                plain = vscode_secret_decrypt(bytes(json.loads(r[0])['data']), aes_key)
-                if plain.startswith('sk-'):
-                    new_val = json.dumps({'type': 'Buffer', 'data': list(vscode_secret_encrypt(new_key, aes_key))})
-                    if apply:
-                        cur.execute('UPDATE ItemTable SET value=? WHERE key=?', (new_val, EXT_KEY))
-                    msgs.append('  重加密 secret 扩展 opencodego.apiKey (无条件)')
-            except Exception:
-                pass
-        # 2) chat.lm.secret.*：值 ∈ ref_keys 才重加密
-        for sk in list_vscode_lm_secret_keys(db):
-            cur.execute('SELECT value FROM ItemTable WHERE key=?', (sk,))
-            r = cur.fetchone()
-            if not r:
-                continue
-            try:
-                plain = vscode_secret_decrypt(bytes(json.loads(r[0])['data']), aes_key)
-            except Exception:
-                continue
-            if plain in ref_keys and plain.startswith('sk-'):
-                new_val = json.dumps({'type': 'Buffer', 'data': list(vscode_secret_encrypt(new_key, aes_key))})
-                if apply:
-                    cur.execute('UPDATE ItemTable SET value=? WHERE key=?', (new_val, sk))
-                msgs.append(f'  重加密 secret {sk[:44]}... (匹配明文key)')
-            elif isinstance(plain, str) and plain.startswith('sk-'):
-                msgs.append(f'  [保留-不同key] {sk[:44]}... -> {mask(plain)}')
-        # 3) 全表字符串替换 旧key/旧指纹 -> 新key/新指纹
-        old_fp, new_fp = fingerprint_of(old_key), fingerprint_of(new_key)
-        cur.execute('SELECT key, value FROM ItemTable')
-        for k, v in cur.fetchall():
-            if not isinstance(v, str):
-                continue
-            hits = []
-            for old, new, tag in ((old_key, new_key, '完整key'), (old_fp, new_fp, '指纹')):
-                if old and old in v:
-                    hits.append((tag, v.count(old)))
-            if hits:
-                if apply:
-                    nv = v.replace(old_key, new_key).replace(old_fp, new_fp)
-                    cur.execute('UPDATE ItemTable SET value=? WHERE key=?', (nv, k))
-                msgs.append(f'  表内替换 {k[:50]} ({", ".join(f"{t}x{n}" for t, n in hits)})')
-        if apply:
-            db.commit()
+        db.execute("INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)", (VSCODE_SECRET_KEY, payload))
+        db.commit()
     finally:
         db.close()
-    return msgs
-
-
-def delete_opencode_auth(apply: bool) -> list[str]:
-    """删除 opencode CLI auth.json 里的 opencode-go 条目（用户已确认不用 opencode）"""
-    if not os.path.isfile(OPENCODE_AUTH):
-        return ['[跳过] opencode auth.json 不存在']
-    d = json.load(open(OPENCODE_AUTH, encoding='utf-8'))
-    if 'opencode-go' not in d:
-        return ['[跳过] auth.json 里没有 opencode-go 条目']
-    old = d['opencode-go'].get('key', '')
-    if apply:
-        del d['opencode-go']
-        json.dump(d, open(OPENCODE_AUTH, 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
-    return [f'  删除 opencode-go 条目 (key={mask(old)})']
 
 
 def vscode_running() -> bool:
-    if os.environ.get('RK_SKIP_VSCODE_CHECK') == '1':
+    if os.environ.get("RK_SKIP_VSCODE_CHECK") == "1":
         return False
     try:
-        r = os.popen('tasklist /FI "IMAGENAME eq Code.exe" /NH 2>nul').read()
-        return 'Code.exe' in r
+        import subprocess
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Code.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return "Code.exe" in result.stdout
     except Exception:
         return False
 
 
-# ─── 主流程 ───────────────────────────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser(description='OpenCode Go key rotator')
-    ap.add_argument('new_key', nargs='?', help='新的 opencode.go API key (sk-...)')
-    ap.add_argument('--detect', action='store_true', help='只检测当前各位置 key 状态')
-    ap.add_argument('--dry-run', action='store_true', help='预览不执行（默认）')
-    ap.add_argument('--apply', action='store_true', help='真正执行替换')
-    ap.add_argument('--delete-opencode-auth', action='store_true', help='同时删除 opencode CLI auth.json 里的旧 key')
-    args = ap.parse_args()
+def _detail(current_url: str | None, current_key: str | None, fallback: str) -> str:
+    if current_url and current_key:
+        return f"{current_url} · {mask(current_key)}"
+    if current_url:
+        return f"{current_url} · Key 未设置"
+    if current_key:
+        return f"地址未设置 · {mask(current_key)}"
+    return fallback
 
-    print('=' * 62)
-    print(' OpenCode Go key rotator')
-    print('=' * 62)
 
-    if args.detect:
-        d = detect()
-        print('各位置当前 key:')
-        for k, v in d.items():
-            print(f'  {k}: {mask(v) if isinstance(v, str) and not v.startswith("ERR") else v}')
-        return
-
-    if not args.new_key or not args.new_key.startswith('sk-'):
-        sys.exit('[!] 请提供新 key（sk- 开头）。用法: python rotate_keys.py <新key> [--apply]')
-
-    if not args.apply:
-        print('[!] 预览模式（dry-run），不写任何文件。加 --apply 执行。')
-
-    d = detect()
-    # 明文文件各自读到的 key 集合（作为 VS Code secret 归属判定依据）
-    ref_keys = {v for v in (d.get('Hermes .env'), d.get('Continue config.yaml'), d.get('dsh .credentials.yaml'))
-                if isinstance(v, str) and v.startswith('sk-')}
-    # 主 key：优先明文里最长的（67 位主 key），fallback 到 VS Code 侧
-    main_cands = [v for k, v in d.items() if isinstance(v, str) and v.startswith('sk-')]
-    old_key = sorted(ref_keys, key=len, reverse=True)[0] if ref_keys else (
-        sorted(main_cands, key=len, reverse=True)[0] if main_cands else None)
-    if not old_key:
-        sys.exit('[!] 无法探测旧 key，请检查各配置是否存在')
-    new_key = args.new_key
-    if new_key == old_key:
-        sys.exit('[!] 新 key 和当前旧 key 相同，无需替换')
-    old_fp, new_fp = fingerprint_of(old_key), fingerprint_of(new_key)
-
-    print(f'旧 key: {mask(old_key)} | 指纹: {mask(old_fp)}')
-    print(f'新 key: {mask(new_key)} | 指纹: {mask(new_fp)}')
-    print(f'（各位置当前 key: ' + ', '.join(f'{k}={mask(v)}' if isinstance(v, str) and v.startswith("sk-") else f'{k}=?' for k, v in d.items()) + '）')
-    print()
-
-    if vscode_running():
-        print('[!] 检测到 VS Code 正在运行！state.vscdb 被占用，写入会失败或损坏。')
-        print('    请先完全退出 VS Code 再执行 --apply。')
-        if args.apply:
-            sys.exit(1)
-    else:
-        print('[✓] VS Code 未运行，可安全写入')
-
-    # 备份
-    files = [HERMES_ENV, CONTINUE_CONFIG, DSH_CREDENTIALS, VSCODE_STATE_DB, CHAT_LM_JSON, OPENCODE_AUTH]
-    if args.apply:
-        bdir = backup(files)
-        print(f'[✓] 备份完成 -> {bdir}')
-    else:
-        print('[.] 本次为预览，不产生备份（apply 时自动备份全部文件）')
-    print()
-
-    # 1) 明文文件：各自用读到的自身 key 替换（兼容 key 分裂场景）
-    print('【1. 明文配置替换】')
-    for f, name, dkey in ((HERMES_ENV, 'Hermes .env', 'Hermes .env'),
-                          (CONTINUE_CONFIG, 'Continue config.yaml', 'Continue config.yaml'),
-                          (CHAT_LM_JSON, 'chatLanguageModels.json', None)):
-        file_key = d.get(dkey) if dkey else None
-        if isinstance(file_key, str) and file_key.startswith('sk-'):
-            pairs = [(file_key, new_key), (fingerprint_of(file_key), new_fp)]
+def _state(target_id: str) -> TargetState:
+    title, location = TARGET_META[target_id]
+    try:
+        if target_id == "hermes":
+            exists = os.path.isfile(HERMES_ENV) or os.path.isfile(HERMES_CONFIG)
+            env = _read_text(HERMES_ENV) if os.path.isfile(HERMES_ENV) else ""
+            config = _read_text(HERMES_CONFIG) if os.path.isfile(HERMES_CONFIG) else ""
+            key = _env_get(env, "OPENAI_API_KEY") or _env_get(env, "OPENCODE_GO_API_KEY")
+            url = _yaml_get(config, ("model", "base_url"))
+        elif target_id == "continue":
+            exists = os.path.isfile(CONTINUE_CONFIG)
+            config = _read_text(CONTINUE_CONFIG) if exists else ""
+            url, key = _continue_values(config)
+            if exists and not _continue_block(config):
+                return TargetState(target_id, title, location, "unsupported", "需配置", "没有 models 配置", False)
+        elif target_id == "dsh":
+            exists = os.path.isfile(DSH_SETTINGS)
+            settings = _read_text(DSH_SETTINGS) if exists else ""
+            provider = _yaml_get(settings, ("agent-default-model", "provider"))
+            if not provider:
+                providers = _yaml_child_keys(settings, ("llm-pi-ai", "providers"))
+                provider = providers[0] if providers else None
+            if exists and not provider:
+                return TargetState(target_id, title, location, "unsupported", "需配置", "没有可用提供方", False)
+            url = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "baseURL")) if provider else None
+            env_name = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "apiKeyEnv")) if provider else None
+            credentials = _read_text(DSH_CREDENTIALS) if os.path.isfile(DSH_CREDENTIALS) else ""
+            key = _yaml_get(credentials, ("refs", env_name)) if env_name else None
+        elif target_id == "vscode":
+            exists = os.path.isfile(VSCODE_STATE_DB) and os.path.isfile(VSCODE_LOCAL_STATE)
+            providers = _load_json(CHAT_LM_JSON, []) if exists else []
+            provider = next((item for item in providers if isinstance(item, dict) and item.get("name") == "Key Router"), {})
+            url = provider.get("url") if isinstance(provider, dict) else None
+            key = _vscode_read_secret() if exists else None
+        elif target_id == "claude":
+            exists = Path(CLAUDE_SETTINGS).parent.is_dir() or os.path.isfile(CLAUDE_SETTINGS)
+            settings = _load_json(CLAUDE_SETTINGS, {}) if exists else {}
+            env = settings.get("env", {}) if isinstance(settings, dict) else {}
+            url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+            key = (env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")) if isinstance(env, dict) else None
         else:
-            pairs = [(old_key, new_key), (old_fp, new_fp)]
-        msgs = replace_in_file(f, pairs, apply=args.apply)
-        print(f'  {name}:')
-        for m in msgs:
-            print(m)
+            exists = Path(PI_SETTINGS).parent.is_dir() or os.path.isfile(PI_SETTINGS)
+            settings = _load_jsonc(PI_SETTINGS, {}) if exists else {}
+            provider_name = settings.get("defaultProvider") if isinstance(settings, dict) else None
+            provider_name = provider_name if isinstance(provider_name, str) and provider_name else "anthropic"
+            models = _load_jsonc(PI_MODELS, {}) if exists else {}
+            providers = models.get("providers", {}) if isinstance(models, dict) else {}
+            provider = providers.get(provider_name, {}) if isinstance(providers, dict) else {}
+            url = provider.get("baseUrl") if isinstance(provider, dict) else None
+            key = provider.get("apiKey") if isinstance(provider, dict) else None
 
-    print()
-    print('【2. dsh .credentials.yaml】')
-    dsh_key = d.get('dsh .credentials.yaml')
-    dsh_pairs = [(dsh_key, new_key)] if isinstance(dsh_key, str) and dsh_key.startswith('sk-') else [(old_key, new_key)]
-    for m in replace_in_file(DSH_CREDENTIALS, dsh_pairs, apply=args.apply):
-        print(m)
+        if not exists:
+            return TargetState(target_id, title, location, "missing", "未安装", "没有找到本机配置", False)
+        return TargetState(
+            target_id, title, location,
+            "ok" if (url or key) else "ready",
+            "已配置" if (url or key) else "可写入",
+            _detail(url, key, "已找到应用，可创建配置"),
+            True, url, key,
+            "需退出 VS Code 后写入" if target_id == "vscode" and vscode_running() else "",
+        )
+    except RotationError as exc:
+        return TargetState(target_id, title, location, "error", "读取失败", str(exc), False)
+    except Exception:
+        return TargetState(target_id, title, location, "error", "读取失败", "配置格式不受支持", False)
 
-    print()
-    print('【3. VS Code state.vscdb】')
-    aes = get_vscode_aes_key()
-    for m in replace_vscode_db(old_key, new_key, aes, ref_keys, args.apply):
-        print(m)
 
-    print()
-    print('【4. opencode CLI auth.json】')
-    if args.delete_opencode_auth:
-        for m in delete_opencode_auth(args.apply):
-            print(m)
+def detect_targets() -> list[dict]:
+    return [_state(target_id).public() for target_id in TARGET_ORDER]
+
+
+def _plan_hermes(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("hermes"))
+    env_text = _read_text(HERMES_ENV) if os.path.isfile(HERMES_ENV) else ""
+    config_text = _read_text(HERMES_CONFIG) if os.path.isfile(HERMES_CONFIG) else ""
+    new_env = _env_set(env_text, "OPENAI_API_KEY", api_key)
+    new_config = _yaml_set(config_text, ("model", "provider"), "custom")
+    new_config = _yaml_set(new_config, ("model", "base_url"), base_url)
+    if new_env != env_text:
+        plan.changes.append(Change("hermes", HERMES_ENV, "OPENAI_API_KEY", new_env))
+    if new_config != config_text:
+        plan.changes.append(Change("hermes", HERMES_CONFIG, "model.provider / model.base_url", new_config))
+    return plan
+
+
+def _plan_continue(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("continue"))
+    text = _read_text(CONTINUE_CONFIG)
+    updated = _continue_set(text, base_url, api_key)
+    if updated != text:
+        plan.changes.append(Change("continue", CONTINUE_CONFIG, "模型 apiBase / apiKey", updated))
+    return plan
+
+
+def _plan_dsh(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("dsh"))
+    settings = _read_text(DSH_SETTINGS)
+    provider = _yaml_get(settings, ("agent-default-model", "provider"))
+    if not provider:
+        providers = _yaml_child_keys(settings, ("llm-pi-ai", "providers"))
+        provider = providers[0] if providers else None
+    if not provider:
+        raise RotationError("dsh 没有可更新的提供方")
+    env_name = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "apiKeyEnv"))
+    if not env_name:
+        raise RotationError("dsh 当前提供方没有 apiKeyEnv")
+    updated_settings = _yaml_set(settings, ("llm-pi-ai", "providers", provider, "baseURL"), base_url)
+    credentials = _read_text(DSH_CREDENTIALS) if os.path.isfile(DSH_CREDENTIALS) else "refs:\n"
+    updated_credentials = _yaml_set(credentials, ("refs", env_name), api_key)
+    if updated_settings != settings:
+        plan.changes.append(Change("dsh", DSH_SETTINGS, f"providers.{provider}.baseURL", updated_settings))
+    if updated_credentials != credentials:
+        plan.changes.append(Change("dsh", DSH_CREDENTIALS, f"refs.{env_name}", updated_credentials))
+    return plan
+
+
+def _plan_vscode(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("vscode"))
+    providers = _load_json(CHAT_LM_JSON, [])
+    if not isinstance(providers, list):
+        raise RotationError("chatLanguageModels.json 顶层必须是数组")
+    provider = next((item for item in providers if isinstance(item, dict) and item.get("name") == "Key Router"), None)
+    if provider is None:
+        provider = {
+            "name": "Key Router",
+            "vendor": "customendpoint",
+            "apiKey": VSCODE_SECRET_REF,
+            "apiType": "chat-completions",
+            "url": base_url,
+        }
+        providers.append(provider)
     else:
-        print('  [跳过] 未指定 --delete-opencode-auth')
+        provider["vendor"] = "customendpoint"
+        provider["apiKey"] = VSCODE_SECRET_REF
+        provider.setdefault("apiType", "chat-completions")
+        provider["url"] = base_url
+        if isinstance(provider.get("models"), list):
+            for model in provider["models"]:
+                if isinstance(model, dict) and "url" in model:
+                    model["url"] = base_url
+    plan.changes.append(Change("vscode", CHAT_LM_JSON, "Key Router Custom Endpoint", _json_dump(providers)))
+    plan.changes.append(Change("vscode", VSCODE_STATE_DB, "SecretStorage API Key", action=lambda: _vscode_write_secret(api_key)))
+    if vscode_running():
+        plan.warnings.append("VS Code 正在运行，正式应用前必须完全退出")
+    return plan
 
-    print()
-    if args.apply:
-        print('✓ 全部完成！建议重启 VS Code 检查模型可用性。')
+
+def _plan_claude(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("claude"))
+    settings = _load_json(CLAUDE_SETTINGS, {})
+    if not isinstance(settings, dict):
+        raise RotationError("Claude Code settings.json 顶层必须是对象")
+    env = settings.setdefault("env", {})
+    if not isinstance(env, dict):
+        raise RotationError("Claude Code settings.json 的 env 必须是对象")
+    env["ANTHROPIC_BASE_URL"] = base_url
+    if "ANTHROPIC_API_KEY" in env and "ANTHROPIC_AUTH_TOKEN" not in env:
+        env["ANTHROPIC_API_KEY"] = api_key
     else:
-        print('^ 以上为预览。确认无误后执行: python rotate_keys.py <新key> --apply')
+        env["ANTHROPIC_AUTH_TOKEN"] = api_key
+        if "ANTHROPIC_API_KEY" in env:
+            env["ANTHROPIC_API_KEY"] = api_key
+    plan.changes.append(Change("claude", CLAUDE_SETTINGS, "ANTHROPIC_BASE_URL / 认证令牌", _json_dump(settings)))
+    return plan
 
 
-if __name__ == '__main__':
+def _plan_pi(base_url: str, api_key: str) -> TargetPlan:
+    plan = TargetPlan(_state("pi"))
+    settings = _load_jsonc(PI_SETTINGS, {})
+    provider_name = settings.get("defaultProvider") if isinstance(settings, dict) else None
+    provider_name = provider_name if isinstance(provider_name, str) and provider_name else "anthropic"
+    models = _load_jsonc(PI_MODELS, {})
+    if not isinstance(models, dict):
+        raise RotationError("Pi models.json 顶层必须是对象")
+    providers = models.setdefault("providers", {})
+    if not isinstance(providers, dict):
+        raise RotationError("Pi models.json 的 providers 必须是对象")
+    provider = providers.setdefault(provider_name, {})
+    if not isinstance(provider, dict):
+        raise RotationError("Pi 当前提供方配置必须是对象")
+    provider["baseUrl"] = base_url
+    provider["apiKey"] = api_key
+    plan.changes.append(Change("pi", PI_MODELS, f"providers.{provider_name}.baseUrl / apiKey", _json_dump(models)))
+    return plan
+
+
+PLANNERS = {
+    "hermes": _plan_hermes,
+    "continue": _plan_continue,
+    "dsh": _plan_dsh,
+    "vscode": _plan_vscode,
+    "claude": _plan_claude,
+    "pi": _plan_pi,
+}
+
+
+def _backup(paths: list[str]) -> tuple[str, dict[str, str | None]]:
+    timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    backup_dir = Path(BACKUP_DIR) / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    mapping: dict[str, str | None] = {}
+    manifest = []
+    for index, path in enumerate(dict.fromkeys(paths), start=1):
+        source = Path(path)
+        if source.is_file():
+            backup_path = backup_dir / f"{index:02d}-{source.name}"
+            shutil.copy2(source, backup_path)
+            mapping[path] = str(backup_path)
+            manifest.append({"path": path, "backup": backup_path.name, "existed": True})
+        else:
+            mapping[path] = None
+            manifest.append({"path": path, "backup": None, "existed": False})
+    _atomic_write_text(str(backup_dir / "manifest.json"), _json_dump(manifest))
+    return str(backup_dir), mapping
+
+
+def _restore(mapping: dict[str, str | None]):
+    for path, backup_path in reversed(list(mapping.items())):
+        if backup_path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, path)
+        elif os.path.isfile(path):
+            os.unlink(path)
+
+
+def run_rotation(
+    base_url: str,
+    new_key: str,
+    target_ids: list[str] | tuple[str, ...],
+    *,
+    apply: bool = False,
+    log: Callable[[str], None] | None = print,
+) -> dict:
+    """预览或执行批量配置。返回值不包含完整密钥。"""
+    url = validate_base_url(base_url)
+    key = validate_key(new_key)
+    selected = list(dict.fromkeys(target_ids))
+    if not selected:
+        raise RotationError("请至少选择一个目标工具")
+    if any(target_id not in PLANNERS for target_id in selected):
+        raise RotationError("包含不支持的目标工具")
+
+    messages: list[str] = []
+    def emit(message: str = ""):
+        messages.append(message)
+        if log:
+            log(message)
+
+    plans: list[TargetPlan] = []
+    for target_id in selected:
+        state = _state(target_id)
+        if not state.selectable:
+            raise RotationError(f"{state.title} 当前不可写入：{state.detail}")
+        plans.append(PLANNERS[target_id](url, key))
+    changes = [change for plan in plans for change in plan.changes]
+    if not changes:
+        raise RotationError("所选工具已经是这组配置，无需修改")
+    if apply and "vscode" in selected and vscode_running():
+        raise RotationError("VS Code 正在运行，请完全退出后重新预览")
+
+    emit("预览模式，不会写入文件" if not apply else "正在备份并应用更改")
+    emit(f"Base URL：{url}")
+    emit(f"API Key：{mask(key)}")
+    emit("")
+    for plan in plans:
+        emit(f"【{plan.target.title}】")
+        for change in plan.changes:
+            emit(f"  将更新 {Path(change.path).name} · {change.summary}")
+        for warning in plan.warnings:
+            emit(f"  注意：{warning}")
+
+    backup_dir = None
+    if apply:
+        backup_dir, mapping = _backup([change.path for change in changes])
+        emit("")
+        emit(f"已备份 {len(mapping)} 个配置位置")
+        try:
+            for change in changes:
+                change.apply()
+        except Exception as exc:
+            try:
+                _restore(mapping)
+            except Exception:
+                raise RotationError("写入失败，且自动恢复未完全成功；请使用备份目录恢复") from exc
+            raise RotationError("写入失败，已从备份恢复原配置") from exc
+        emit(f"已完成 {len(plans)} 个工具的批量配置")
+    else:
+        emit("")
+        emit(f"预览完成：{len(plans)} 个工具，{len(changes)} 处更改")
+
+    return {
+        "applied": apply,
+        "backup_dir": backup_dir,
+        "vscode_running": vscode_running() if "vscode" in selected else False,
+        "target_ids": selected,
+        "change_count": len(changes),
+        "changes": [
+            {
+                "targetId": plan.target.id,
+                "target": plan.target.title,
+                "file": Path(change.path).name,
+                "summary": change.summary,
+            }
+            for plan in plans
+            for change in plan.changes
+        ],
+        "new_key_masked": mask(key),
+        "base_url": url,
+        "messages": messages,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Key Router · 批量配置 API 地址与密钥")
+    parser.add_argument("--detect", action="store_true", help="检测支持的本机工具")
+    parser.add_argument("--url", help="新的 API Base URL")
+    parser.add_argument("--key", help="新的 API Key")
+    parser.add_argument("--targets", default=",".join(TARGET_ORDER), help="逗号分隔的目标 ID")
+    parser.add_argument("--apply", action="store_true", help="正式写入；默认只预览")
+    args = parser.parse_args()
+    if args.detect:
+        for item in detect_targets():
+            print(f"{item['title']}: {item['badge']} · {item['detail']}")
+        return
+    try:
+        run_rotation(
+            args.url or "",
+            args.key or "",
+            [item.strip() for item in args.targets.split(",") if item.strip()],
+            apply=args.apply,
+        )
+    except RotationError as exc:
+        raise SystemExit(f"错误：{exc}") from exc
+
+
+if __name__ == "__main__":
     main()
