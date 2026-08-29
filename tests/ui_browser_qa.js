@@ -51,7 +51,7 @@ async function main() {
 
     await page.goto(url, {waitUntil: 'networkidle'});
     await page.waitForFunction(() => document.querySelectorAll('.target-row').length === 9);
-    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.4.1 · DEMO') throw new Error('界面版本号不正确');
+    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.4.2 · DEMO') throw new Error('界面版本号不正确');
     if ((await page.locator('.target-row').count()) !== 9) throw new Error('目标数量不正确');
     const dshRow = page.locator('.target-row').filter({hasText: 'dsh'}).first();
     if (!(await dshRow.locator('.target-state').textContent()).includes('已配置')) throw new Error('dsh 配置状态显示错误');
@@ -71,14 +71,14 @@ async function main() {
     if (visibleText.includes('sk-demo-1234567890-example')) throw new Error('页面正文泄露了完整 API Key');
     const wideOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (wideOverflow) throw new Error('宽屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v041.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v042.png'), fullPage: true});
     await page.screenshot({path: path.resolve('docs/key-router-ui.png'), fullPage: true});
 
     await page.setViewportSize({width: 760, height: 900});
     await wait(250);
     const narrowOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (narrowOverflow) throw new Error('窄屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v041-narrow.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v042-narrow.png'), fullPage: true});
     if (consoleProblems.length) throw new Error(`浏览器控制台异常：${consoleProblems.join(' | ')}`);
 
     await page.locator('#quitButton').click();

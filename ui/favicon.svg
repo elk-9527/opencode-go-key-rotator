@@ -1,10 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
-  <style>
-    .tile{fill:#fbfaf7}.node{fill:#f0ddd1;stroke:#a14f2a}.route{stroke:#a14f2a}
-    @media (prefers-color-scheme:dark){.tile{fill:#201d1a}.node{fill:#492d20;stroke:#d97948}.route{stroke:#d97948}}
-  </style>
-  <rect class="tile" x="2" y="2" width="60" height="60" rx="10"/>
-  <rect class="node" x="12" y="14" width="19" height="13" rx="1" stroke-width="3"/>
-  <rect class="node" x="35" y="37" width="17" height="13" rx="1" stroke-width="3"/>
-  <path class="route" d="M31 20.5h4c10 0 10 23 0 23h-4M12 43.5h10" fill="none" stroke-width="3" stroke-linecap="square"/>
+  <rect x="3" y="3" width="58" height="58" rx="13" fill="#171a21"/>
+  <path d="M25.5 32h9M33.5 32l9.5-9.5M33.5 32l9.5 9.5" fill="none" stroke="#f6f7f9" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="17.5" cy="32" r="8" fill="none" stroke="#f6f7f9" stroke-width="5"/>
+  <rect x="40.5" y="17" width="12" height="11" rx="2.75" fill="#3378f3"/>
+  <rect x="40.5" y="36" width="12" height="11" rx="2.75" fill="#3378f3"/>
 </svg>

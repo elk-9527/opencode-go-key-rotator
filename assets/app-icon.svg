@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Key Router</title>
+  <rect x="28" y="28" width="456" height="456" rx="104" fill="#171a21"/>
+  <path d="M204 256h72M269 256l76-76M269 256l76 76" fill="none" stroke="#f6f7f9" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="140" cy="256" r="66" fill="none" stroke="#f6f7f9" stroke-width="40"/>
+  <rect x="326" y="137" width="96" height="86" rx="22" fill="#3378f3"/>
+  <rect x="326" y="289" width="96" height="86" rx="22" fill="#3378f3"/>
+</svg>

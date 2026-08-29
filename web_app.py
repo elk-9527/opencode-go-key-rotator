@@ -25,7 +25,7 @@ import webbrowser
 import rotate_keys as core
 
 
-APP_VERSION = '0.4.1'
+APP_VERSION = '0.4.2'
 MAX_BODY = 32 * 1024
 PREVIEW_TTL_SECONDS = 15 * 60
 MAX_PREVIEW_TOKENS = 128
