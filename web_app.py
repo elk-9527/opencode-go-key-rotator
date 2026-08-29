@@ -25,9 +25,10 @@ import webbrowser
 import rotate_keys as core
 
 
-APP_VERSION = '0.4.0'
+APP_VERSION = '0.4.1'
 MAX_BODY = 32 * 1024
 PREVIEW_TTL_SECONDS = 15 * 60
+MAX_PREVIEW_TOKENS = 128
 IDLE_SHUTDOWN_SECONDS = 60 * 60
 
 
@@ -53,6 +54,7 @@ class AppServer(ThreadingHTTPServer):
         self.demo = demo
         self.csrf_token = secrets.token_urlsafe(32)
         self.operation_lock = threading.Lock()
+        self.preview_lock = threading.Lock()
         self.preview_tokens: dict[str, tuple[str, float]] = {}
         self.last_request_at = time.monotonic()
         self.assets = resource_dir()
@@ -63,13 +65,18 @@ class AppServer(ThreadingHTTPServer):
     def make_preview_token(self, base_url: str, new_key: str, target_ids: list[str], target_options: dict) -> str:
         token = secrets.token_urlsafe(28)
         digest = self._preview_digest(base_url, new_key, target_ids, target_options)
-        self.preview_tokens[token] = (digest, time.monotonic())
-        self._prune_preview_tokens()
+        with self.preview_lock:
+            self.preview_tokens[token] = (digest, time.monotonic())
+            self._prune_preview_tokens()
+            while len(self.preview_tokens) > MAX_PREVIEW_TOKENS:
+                oldest = min(self.preview_tokens, key=lambda item: self.preview_tokens[item][1])
+                self.preview_tokens.pop(oldest, None)
         return token
 
     def consume_preview_token(self, token: str, base_url: str, new_key: str, target_ids: list[str], target_options: dict) -> bool:
-        self._prune_preview_tokens()
-        stored = self.preview_tokens.pop(token, None)
+        with self.preview_lock:
+            self._prune_preview_tokens()
+            stored = self.preview_tokens.pop(token, None)
         if not stored:
             return False
         digest, _created = stored
@@ -107,6 +114,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.touch()
+        if not self._trusted_host():
+            self._json({'ok': False, 'error': '请求来源无效'}, HTTPStatus.FORBIDDEN)
+            return
         path = self.path.split('?', 1)[0]
         if path == '/api/session':
             self._json({
@@ -126,7 +136,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.server.touch()
-        if self.headers.get('X-Key-Rotator-Token') != self.server.csrf_token:
+        if not self._trusted_host() or not self._trusted_origin():
+            self._json({'ok': False, 'error': '请求来源无效'}, HTTPStatus.FORBIDDEN)
+            return
+        supplied_token = self.headers.get('X-Key-Rotator-Token', '')
+        if not secrets.compare_digest(supplied_token, self.server.csrf_token):
             self._json({'ok': False, 'error': '会话校验失败，请刷新窗口'}, HTTPStatus.FORBIDDEN)
             return
         if self.path == '/api/preview':
@@ -142,6 +156,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
             self._json({'ok': False, 'error': '接口不存在'}, HTTPStatus.NOT_FOUND)
+
+    def _trusted_host(self) -> bool:
+        port = self.server.server_address[1]
+        host = self.headers.get('Host', '').strip().lower()
+        return host in {f'127.0.0.1:{port}', f'localhost:{port}', f'[::1]:{port}'}
+
+    def _trusted_origin(self) -> bool:
+        if self.headers.get('Sec-Fetch-Site', '').strip().lower() == 'cross-site':
+            return False
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True
+        port = self.server.server_address[1]
+        return origin.rstrip('/').lower() in {
+            f'http://127.0.0.1:{port}',
+            f'http://localhost:{port}',
+            f'http://[::1]:{port}',
+        }
 
     def _static(self, path: str):
         relative = 'index.html' if path in ('', '/') else path.lstrip('/')
@@ -207,7 +239,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 running = core.vscode_running()
             self._json({'ok': True, 'items': items, 'vscodeRunning': running})
         except Exception as exc:
-            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._json({'ok': False, 'error': '检测失败，请检查配置文件权限或格式'}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _install_extension(self):
         try:
@@ -227,7 +259,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         except core.RotationError as exc:
             self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
         except Exception as exc:
-            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._json({'ok': False, 'error': '扩展安装失败，请重试'}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _pick_dsh_config(self):
         try:
@@ -246,7 +278,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         except core.RotationError as exc:
             self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
         except Exception as exc:
-            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._json({'ok': False, 'error': '无法读取所选 DSH 配置'}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _rotation(self, *, apply: bool):
         try:
@@ -254,8 +286,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json({'ok': False, 'error': str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        base_url = str(body.get('baseUrl', '')).strip()
-        new_key = str(body.get('newKey', '')).strip()
+        base_url = body.get('baseUrl', '')
+        new_key = body.get('newKey', '')
+        if not isinstance(base_url, str) or not isinstance(new_key, str):
+            self._json({'ok': False, 'error': '连接参数格式无效'}, HTTPStatus.BAD_REQUEST)
+            return
         target_ids = body.get('targetIds', [])
         target_options = body.get('targetOptions', {})
         if not isinstance(target_ids, list) or any(not isinstance(item, str) for item in target_ids):
@@ -338,11 +373,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         except core.RotationError as exc:
             self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.CONFLICT)
         except Exception as exc:
-            self._json({'ok': False, 'error': safe_text(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._json({'ok': False, 'error': '操作失败，未完成配置写入'}, HTTPStatus.INTERNAL_SERVER_ERROR)
         finally:
             self.server.operation_lock.release()
 
     def _read_json(self) -> dict:
+        if self.headers.get('Transfer-Encoding'):
+            raise ValueError('不支持分块请求')
+        media_type = self.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+        if media_type != 'application/json':
+            raise ValueError('请求内容类型必须是 JSON')
         try:
             size = int(self.headers.get('Content-Length', '0'))
         except ValueError as exc:
@@ -350,9 +390,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if size <= 0 or size > MAX_BODY:
             raise ValueError('请求内容为空或过大')
         try:
-            return json.loads(self.rfile.read(size).decode('utf-8'))
+            payload = json.loads(self.rfile.read(size).decode('utf-8'))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError('请求内容不是有效 JSON') from exc
+        if not isinstance(payload, dict):
+            raise ValueError('请求内容必须是 JSON 对象')
+        return payload
 
     def _json(self, data: dict, status=HTTPStatus.OK):
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
@@ -482,6 +525,9 @@ def main():
     server = AppServer(('127.0.0.1', 0), RequestHandler, demo=args.demo)
     port = server.server_address[1]
     url = f'http://127.0.0.1:{port}/'
+    port_file = os.environ.get('RK_PORT_FILE')
+    if port_file:
+        core._atomic_write_text(port_file, str(port))
     threading.Thread(target=idle_watchdog, args=(server,), daemon=True).start()
     if not args.no_open:
         threading.Timer(0.35, launch_app_window, args=(url,)).start()

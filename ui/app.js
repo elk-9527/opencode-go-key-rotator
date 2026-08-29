@@ -274,8 +274,9 @@ function configureDshCandidate(item, path) {
   item.providers = providers;
   item.selectedProvider = preferred?.id || '';
   item.selectable = Boolean(preferred);
-  item.state = preferred ? 'ready' : 'unsupported';
-  item.badge = preferred ? '可写入' : '需配置';
+  const configured = Boolean(preferred?.baseUrl);
+  item.state = preferred ? (configured ? 'ok' : 'ready') : 'unsupported';
+  item.badge = preferred ? (configured ? '已配置' : '可写入') : '需配置';
   item.detail = preferred ? (preferred.baseUrl || `提供商 ${preferred.id}`) : '没有带 apiKeyEnv 的可写提供商';
   state.targetOptions.dsh = {
     settingsPath: candidate.path,
@@ -350,7 +351,11 @@ function renderInspector(item) {
       };
       item.selectedProvider = providerSelect.value;
       const provider = item.providers.find((entry) => entry.id === providerSelect.value);
-      if (provider) item.detail = provider.baseUrl || `提供商 ${provider.id}`;
+      if (provider) {
+        item.detail = provider.baseUrl || `提供商 ${provider.id}`;
+        item.state = provider.baseUrl ? 'ok' : 'ready';
+        item.badge = provider.baseUrl ? '已配置' : '可写入';
+      }
       invalidatePreview();
       renderTargets(state.targets);
     });

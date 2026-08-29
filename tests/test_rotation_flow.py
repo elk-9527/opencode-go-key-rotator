@@ -278,7 +278,9 @@ agent-default-model:
         self.assertEqual(claude["env"]["ANTHROPIC_AUTH_TOKEN"], NEW_KEY)
         self.assertEqual(claude["env"]["KEEP_ME"], "yes")
 
-        pi = json.loads(self.paths["PI_MODELS"].read_text(encoding="utf-8"))
+        pi_text = self.paths["PI_MODELS"].read_text(encoding="utf-8")
+        self.assertIn("// JSONC comments and trailing commas are accepted", pi_text)
+        pi = json.loads(core._strip_jsonc(pi_text))
         self.assertEqual(pi["providers"]["anthropic"]["baseUrl"], NEW_URL)
         self.assertEqual(pi["providers"]["anthropic"]["apiKey"], NEW_KEY)
         self.assertEqual(pi["providers"]["anthropic"]["modelOverrides"]["demo"]["maxTokens"], 1234)
@@ -289,9 +291,14 @@ agent-default-model:
     def test_failed_apply_restores_original_files(self):
         tracked = [
             self.paths["HERMES_ENV"], self.paths["HERMES_CONFIG"],
-            self.paths["CHAT_LM_JSON"], self.paths["VSCODE_STATE_DB"],
+            self.paths["CHAT_LM_JSON"],
         ]
         before = {path: file_hash(path) for path in tracked}
+        database = sqlite3.connect(self.paths["VSCODE_STATE_DB"])
+        try:
+            database_before = database.execute("SELECT key, value FROM ItemTable ORDER BY key").fetchall()
+        finally:
+            database.close()
         original_writer = core._vscode_write_secret
         core._vscode_write_secret = lambda _key: (_ for _ in ()).throw(OSError("synthetic failure"))
         try:
@@ -301,6 +308,13 @@ agent-default-model:
             core._vscode_write_secret = original_writer
         after = {path: file_hash(path) for path in tracked}
         self.assertEqual(before, after)
+        database = sqlite3.connect(self.paths["VSCODE_STATE_DB"])
+        try:
+            database_after = database.execute("SELECT key, value FROM ItemTable ORDER BY key").fetchall()
+            self.assertEqual(database.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        finally:
+            database.close()
+        self.assertEqual(database_before, database_after)
 
     def test_dsh_manual_path_and_provider_are_used_without_drive_scan(self):
         manual = self.root / "portable-dsh" / "settings.yaml"
@@ -347,6 +361,91 @@ agent-default-model:
         with self.assertRaises(core.RotationError):
             core.install_vscode_extension("unknown.publisher-extension")
 
+    def test_obsolete_extension_folder_is_not_reported_as_installed(self):
+        metadata = core.EXTENSION_META["opencode_copilot"]
+        directory_name = f"{metadata['id'].lower()}-1.0.0"
+        (self.paths["VSCODE_EXTENSIONS_DIR"] / ".obsolete").write_text(
+            json.dumps({directory_name: True}), encoding="utf-8"
+        )
+        installed = core.installed_vscode_extensions([], query_cli=False)
+        self.assertNotIn(metadata["id"].lower(), installed)
+
+    def test_custom_vscode_extension_directory_from_shortcut_is_detected(self):
+        metadata = core.EXTENSION_META["opencode_copilot"]
+        standard = self.paths["VSCODE_EXTENSIONS_DIR"] / f"{metadata['id'].lower()}-1.0.0"
+        standard.rmdir()
+        custom = self.root / "portable-code" / "extensions"
+        (custom / f"{metadata['id'].lower()}-2.0.0").mkdir(parents=True)
+        instances = [{
+            "path": str(self.root / "Code.exe"),
+            "arguments": f'--extensions-dir="{custom}"',
+            "workingDirectory": str(self.root),
+        }]
+        installed = core.installed_vscode_extensions(instances, query_cli=False)
+        self.assertEqual(installed[metadata["id"].lower()], "2.0.0")
+
+    def test_vscode_secret_storage_failure_disables_writes(self):
+        original = core.get_vscode_aes_key
+        core.get_vscode_aes_key = lambda: (_ for _ in ()).throw(OSError("blocked"))
+        try:
+            item = core._state("vscode", vscode_instances=[])
+        finally:
+            core.get_vscode_aes_key = original
+        self.assertFalse(item.selectable)
+        self.assertEqual(item.badge, "不可写")
+        self.assertNotIn("blocked", item.detail)
+
+    def test_claude_new_config_uses_api_key_header_variable(self):
+        self.paths["CLAUDE_SETTINGS"].unlink()
+        state = core.TargetState(
+            "claude", "Claude Code", str(self.paths["CLAUDE_SETTINGS"]),
+            "ready", "可写入", "test", True,
+        )
+        plan = core._plan_claude(NEW_URL, NEW_KEY, state=state)
+        self.assertEqual(len(plan.changes), 1)
+        payload = json.loads(plan.changes[0].after_text)
+        self.assertEqual(payload["env"]["ANTHROPIC_API_KEY"], NEW_KEY)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", payload["env"])
+
+    def test_pi_without_existing_provider_is_not_selectable(self):
+        self.paths["PI_MODELS"].write_text('{"providers": {}}\n', encoding="utf-8")
+        item = core._state("pi")
+        self.assertFalse(item.selectable)
+        self.assertEqual(item.badge, "需配置")
+
+    def test_sqlite_wal_backup_is_complete_and_restore_removes_sidecars(self):
+        path = self.paths["VSCODE_STATE_DB"]
+        writer = sqlite3.connect(path)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO ItemTable(key, value) VALUES (?, ?)", ("wal-only", "before"))
+        writer.commit()
+        self.assertTrue(Path(str(path) + "-wal").is_file())
+
+        _backup_dir, mapping = core._backup([str(path)])
+        snapshot = sqlite3.connect(mapping[str(path)])
+        try:
+            self.assertEqual(snapshot.execute("SELECT value FROM ItemTable WHERE key='wal-only'").fetchone()[0], "before")
+            self.assertEqual(snapshot.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        finally:
+            snapshot.close()
+
+        writer.execute("UPDATE ItemTable SET value='after' WHERE key='wal-only'")
+        writer.commit()
+        writer.close()
+        Path(str(path) + "-wal").write_bytes(b"stale-wal")
+        Path(str(path) + "-shm").write_bytes(b"stale-shm")
+        core._restore(mapping)
+
+        restored = sqlite3.connect(path)
+        try:
+            self.assertEqual(restored.execute("SELECT value FROM ItemTable WHERE key='wal-only'").fetchone()[0], "before")
+            self.assertEqual(restored.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        finally:
+            restored.close()
+        self.assertFalse(Path(str(path) + "-wal").exists())
+        self.assertFalse(Path(str(path) + "-shm").exists())
+
     def test_validation_accepts_non_sk_key_and_blocks_unsafe_urls(self):
         self.assertEqual(core.validate_key("token-1234"), "token-1234")
         self.assertEqual(core.validate_base_url("http://127.0.0.1:11434/v1/"), "http://127.0.0.1:11434/v1")
@@ -354,6 +453,18 @@ agent-default-model:
             core.validate_base_url("http://remote.example.com/v1")
         with self.assertRaises(core.RotationError):
             core.validate_base_url("https://example.com/v1?token=secret")
+        for unsafe in (
+            "https://example.com:abc/v1",
+            "https://example.com:65536/v1",
+            " https://example.com/v1",
+            "https://example.com/v1\r\n",
+            "https://example.com\\@evil.example/v1",
+        ):
+            with self.subTest(unsafe=repr(unsafe)):
+                with self.assertRaises(core.RotationError):
+                    core.validate_base_url(unsafe)
+        with self.assertRaises(core.RotationError):
+            core.validate_key(" token-1234")
         settings = '{\n  "editor.fontSize": 14 // keep this comment\n}\n'
         updated = core._jsonc_set_top_level(settings, "demo.baseUrl", NEW_URL)
         self.assertEqual(json.loads(core._strip_jsonc(updated))["demo.baseUrl"], NEW_URL)

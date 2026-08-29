@@ -11,6 +11,7 @@ import base64
 import ctypes
 import ctypes.wintypes as wt
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -34,7 +35,10 @@ def _paths() -> dict[str, str]:
     home = Path.home()
     appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
     localappdata = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-    hermes_home = Path(os.environ.get("HERMES_HOME") or r"E:\Program Files\Hermes")
+    # Hermes 的用户配置目录与程序安装目录是两回事。官方默认使用
+    # ~/.hermes；HERMES_HOME 只在用户显式覆盖时生效。
+    hermes_home = Path(os.environ.get("HERMES_HOME") or home / ".hermes")
+    claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
     app_home = localappdata / "Key Router"
     paths = {
         "HERMES_ENV": str(hermes_home / ".env"),
@@ -47,7 +51,7 @@ def _paths() -> dict[str, str]:
         "VSCODE_USER_SETTINGS": str(appdata / "Code" / "User" / "settings.json"),
         "VSCODE_EXTENSIONS_DIR": str(Path(os.environ.get("VSCODE_EXTENSIONS") or home / ".vscode" / "extensions")),
         "CHAT_LM_JSON": str(appdata / "Code" / "User" / "chatLanguageModels.json"),
-        "CLAUDE_SETTINGS": str(home / ".claude" / "settings.json"),
+        "CLAUDE_SETTINGS": str(claude_home / "settings.json"),
         "PI_SETTINGS": str(home / ".pi" / "agent" / "settings.json"),
         "PI_MODELS": str(home / ".pi" / "agent" / "models.json"),
         "BACKUP_DIR": str(app_home / "backups"),
@@ -192,6 +196,7 @@ def _dedupe_discovery(items: list[dict]) -> list[dict]:
     return output
 
 
+@lru_cache(maxsize=16)
 def _shortcut_targets(name_pattern: str) -> list[dict]:
     """从开始菜单快捷方式取得真实目标；不会扫描磁盘。"""
     if os.name != "nt":
@@ -208,7 +213,12 @@ $rows = foreach ($root in $roots) {
     ForEach-Object {
       $shortcut = $shell.CreateShortcut($_.FullName)
       if ($shortcut.TargetPath) {
-        [pscustomobject]@{ path = $shortcut.TargetPath; shortcut = $_.FullName }
+        [pscustomobject]@{
+          path = $shortcut.TargetPath
+          shortcut = $_.FullName
+          arguments = $shortcut.Arguments
+          workingDirectory = $shortcut.WorkingDirectory
+        }
       }
     }
 }
@@ -228,7 +238,13 @@ $rows = foreach ($root in $roots) {
         payload = json.loads(result.stdout)
         rows = payload if isinstance(payload, list) else [payload]
         return [
-            {"path": row.get("path", ""), "source": "开始菜单快捷方式", "detail": row.get("shortcut", "")}
+            {
+                "path": row.get("path", ""),
+                "source": "开始菜单快捷方式",
+                "detail": row.get("shortcut", ""),
+                "arguments": row.get("arguments", ""),
+                "workingDirectory": row.get("workingDirectory", ""),
+            }
             for row in rows if isinstance(row, dict)
         ]
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -291,6 +307,29 @@ def _registry_uninstall_matches(pattern: str) -> list[dict]:
         except OSError:
             continue
     return output
+
+
+def _command_discovery(commands: tuple[str, ...], label: str = "PATH 命令") -> list[dict]:
+    items = []
+    for command in commands:
+        located = shutil.which(command)
+        if located:
+            items.append({"path": located, "source": label})
+    return _dedupe_discovery(items)
+
+
+def discover_hermes_installations() -> list[dict]:
+    items = _command_discovery(("hermes", "hermes.cmd", "hermes.exe"))
+    items.extend(_shortcut_targets(r"^Hermes(?: Agent| Desktop)?$"))
+    return _dedupe_discovery(items)
+
+
+def discover_claude_installations() -> list[dict]:
+    return _command_discovery(("claude", "claude.cmd", "claude.exe"))
+
+
+def discover_pi_installations() -> list[dict]:
+    return _command_discovery(("pi", "pi.cmd", "pi.exe"))
 
 
 def discover_dsh_installations() -> list[dict]:
@@ -399,16 +438,81 @@ def discover_vscode_installations() -> list[dict]:
     return _dedupe_discovery(normalized)
 
 
+def _shortcut_option_path(item: dict, option_name: str) -> str:
+    arguments = str(item.get("arguments") or "")
+    match = re.search(
+        rf"(?:^|\s)--{re.escape(option_name)}(?:\s*=\s*|\s+)(?:\"([^\"]+)\"|'([^']+)'|(\S+))",
+        arguments,
+        re.I,
+    )
+    if not match:
+        return ""
+    raw = next((part for part in match.groups() if part is not None), "")
+    expanded = os.path.expandvars(raw.strip())
+    candidate = Path(expanded).expanduser()
+    if not candidate.is_absolute() and item.get("workingDirectory"):
+        candidate = Path(str(item["workingDirectory"])) / candidate
+    return os.path.normpath(str(candidate))
+
+
+def _vscode_instance_cli_args(item: dict) -> list[str]:
+    """只继承会改变 VS Code 数据位置的快捷方式参数。"""
+    output = []
+    for option_name in ("user-data-dir", "extensions-dir"):
+        value = _shortcut_option_path(item, option_name)
+        if value:
+            output.append(f"--{option_name}={value}")
+    return output
+
+
+def discover_vscode_extension_dirs(instances: list[dict] | None = None) -> list[Path]:
+    roots = [Path(VSCODE_EXTENSIONS_DIR)]
+    for item in instances if instances is not None else discover_vscode_installations():
+        custom = _shortcut_option_path(item, "extensions-dir")
+        if custom:
+            roots.append(Path(custom))
+    seen = set()
+    output = []
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(str(root)))
+        if key not in seen:
+            seen.add(key)
+            output.append(root)
+    return output
+
+
+def _obsolete_extension_directories(root: Path) -> set[str]:
+    path = root / ".obsolete"
+    if not path.is_file():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    return {
+        os.path.normcase(str(name))
+        for name, obsolete in payload.items()
+        if obsolete
+    }
+
+
 def installed_vscode_extensions(
     instances: list[dict] | None = None,
     *,
     query_cli: bool = False,
 ) -> dict[str, str]:
     installed: dict[str, str] = {}
-    root = Path(VSCODE_EXTENSIONS_DIR)
-    if root.is_dir():
+    vscode = instances if instances is not None else discover_vscode_installations()
+    for root in discover_vscode_extension_dirs(vscode):
+        if not root.is_dir():
+            continue
+        obsolete = _obsolete_extension_directories(root)
         for directory in root.iterdir():
             if not directory.is_dir():
+                continue
+            if os.path.normcase(directory.name) in obsolete:
                 continue
             lower = directory.name.lower()
             for metadata in EXTENSION_META.values():
@@ -416,12 +520,12 @@ def installed_vscode_extensions(
                 if lower == extension_id or lower.startswith(extension_id + "-"):
                     version = directory.name[len(extension_id):].lstrip("-")
                     installed[extension_id] = version or "已安装"
-    vscode = instances if instances is not None else discover_vscode_installations()
     if query_cli and vscode:
-        executable = vscode[0]["path"]
+        instance = vscode[0]
+        executable = instance.get("cli") or instance["path"]
         try:
             result = subprocess.run(
-                [executable, "--list-extensions", "--show-versions"],
+                [executable, *_vscode_instance_cli_args(instance), "--list-extensions", "--show-versions"],
                 capture_output=True, text=True, timeout=12, creationflags=_creation_flags(),
             )
             if result.returncode == 0:
@@ -462,10 +566,11 @@ def install_vscode_extension(extension_id: str) -> dict:
     instances = discover_vscode_installations()
     if not instances:
         raise RotationError("没有找到 VS Code，无法安装扩展")
-    executable = instances[0]["path"]
+    instance = instances[0]
+    executable = instance.get("cli") or instance["path"]
     try:
         result = subprocess.run(
-            [executable, "--install-extension", metadata["id"], "--force"],
+            [executable, *_vscode_instance_cli_args(instance), "--install-extension", metadata["id"], "--force"],
             capture_output=True, text=True, timeout=180, creationflags=_creation_flags(),
         )
     except subprocess.TimeoutExpired as exc:
@@ -539,15 +644,23 @@ def mask(value: str | None) -> str:
 
 
 def validate_key(value: str) -> str:
+    if not isinstance(value, str):
+        raise RotationError("API Key 格式不正确")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise RotationError("API Key 不能包含空格、换行或控制字符")
     key = value.strip()
     if not 4 <= len(key) <= 2048:
         raise RotationError("API Key 长度应为 4–2048 个字符")
-    if any(character.isspace() or ord(character) < 32 for character in key):
-        raise RotationError("API Key 不能包含空格、换行或控制字符")
     return key
 
 
 def validate_base_url(value: str) -> str:
+    if not isinstance(value, str):
+        raise RotationError("Base URL 格式不正确")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise RotationError("Base URL 不能包含空格、换行或控制字符")
+    if "\\" in value:
+        raise RotationError("Base URL 不能包含反斜杠")
     raw = value.strip()
     if not raw or len(raw) > 2048:
         raise RotationError("Base URL 不能为空或过长")
@@ -557,6 +670,12 @@ def validate_base_url(value: str) -> str:
         raise RotationError("Base URL 格式不正确") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RotationError("Base URL 必须是完整的 http:// 或 https:// 地址")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RotationError("Base URL 端口无效") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise RotationError("Base URL 端口无效")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise RotationError("Base URL 不能包含账号、密码、查询参数或锚点")
     local_hosts = {"localhost", "127.0.0.1", "::1"}
@@ -566,7 +685,7 @@ def validate_base_url(value: str) -> str:
 
 
 def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="strict", newline="") as file:
+    with open(path, "r", encoding="utf-8-sig", errors="strict", newline="") as file:
         return file.read()
 
 
@@ -596,7 +715,7 @@ def _load_json(path: str, default):
     if not os.path.isfile(path):
         return default
     try:
-        with open(path, encoding="utf-8") as file:
+        with open(path, encoding="utf-8-sig") as file:
             return json.load(file)
     except (OSError, json.JSONDecodeError) as exc:
         raise RotationError(f"配置文件无法解析：{Path(path).name}") from exc
@@ -670,6 +789,128 @@ def _jsonc_set_top_level(text: str, key: str, value: str) -> str:
     comma = "," if parsed else ""
     insertion = f"{newline}  {encoded_key}: {encoded_value}{comma}{newline}"
     return source[:open_index + 1] + insertion + rest
+
+
+def _jsonc_tokens(text: str) -> list[tuple[str, str | None, int, int]]:
+    """返回忽略空白与注释的轻量 JSONC 词元，用于精确替换既有字段。"""
+    tokens = []
+    index = 0
+    punctuation = "{}[]:,"
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            closing = text.find("*/", index + 2)
+            index = len(text) if closing < 0 else closing + 2
+            continue
+        if char == '"':
+            start = index
+            index += 1
+            escaped = False
+            while index < len(text):
+                current = text[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    break
+            raw = text[start:index]
+            tokens.append(("string", json.loads(raw), start, index))
+            continue
+        if char in punctuation:
+            tokens.append((char, None, index, index + 1))
+            index += 1
+            continue
+        start = index
+        while index < len(text) and not text[index].isspace() and text[index] not in punctuation:
+            if text.startswith("//", index) or text.startswith("/*", index):
+                break
+            index += 1
+        tokens.append(("literal", text[start:index], start, index))
+    return tokens
+
+
+def _jsonc_value_end(tokens: list[tuple[str, str | None, int, int]], start: int) -> int:
+    if start >= len(tokens):
+        raise RotationError("JSONC 字段缺少值")
+    opening = tokens[start][0]
+    if opening not in {"{", "["}:
+        return start + 1
+    stack = [opening]
+    matching = {"}": "{", "]": "["}
+    for index in range(start + 1, len(tokens)):
+        kind = tokens[index][0]
+        if kind in {"{", "["}:
+            stack.append(kind)
+        elif kind in matching:
+            if not stack or stack[-1] != matching[kind]:
+                raise RotationError("JSONC 括号结构无效")
+            stack.pop()
+            if not stack:
+                return index + 1
+    raise RotationError("JSONC 括号未闭合")
+
+
+def _jsonc_property_span(
+    tokens: list[tuple[str, str | None, int, int]],
+    object_index: int,
+    key: str,
+) -> tuple[int, int] | None:
+    if tokens[object_index][0] != "{":
+        return None
+    object_end = _jsonc_value_end(tokens, object_index)
+    index = object_index + 1
+    while index < object_end - 1:
+        if (
+            tokens[index][0] == "string"
+            and index + 2 < object_end
+            and tokens[index + 1][0] == ":"
+        ):
+            value_index = index + 2
+            value_end = _jsonc_value_end(tokens, value_index)
+            if tokens[index][1] == key:
+                return value_index, value_end
+            index = value_end
+        else:
+            index += 1
+    return None
+
+
+def _jsonc_replace_nested_strings(
+    text: str,
+    object_path: tuple[str, ...],
+    updates: dict[str, str],
+) -> str | None:
+    """只替换既有嵌套字段；字段缺失时返回 None，由调用方安全降级。"""
+    tokens = _jsonc_tokens(text)
+    if not tokens or tokens[0][0] != "{":
+        return None
+    object_index = 0
+    for part in object_path:
+        span = _jsonc_property_span(tokens, object_index, part)
+        if not span or tokens[span[0]][0] != "{":
+            return None
+        object_index = span[0]
+    replacements = []
+    for key, value in updates.items():
+        span = _jsonc_property_span(tokens, object_index, key)
+        if not span:
+            return None
+        start = tokens[span[0]][2]
+        end = tokens[span[1] - 1][3]
+        replacements.append((start, end, json.dumps(value, ensure_ascii=False)))
+    output = text
+    for start, end, replacement in sorted(replacements, reverse=True):
+        output = output[:start] + replacement + output[end:]
+    return output
 
 
 def _unquote_yaml(value: str | None) -> str | None:
@@ -840,12 +1081,16 @@ def _continue_set(text: str, base_url: str, api_key: str) -> str:
     return "".join(lines)
 
 
+def _sqlite_readonly_uri(path: str | Path) -> str:
+    return Path(path).resolve().as_uri() + "?mode=ro"
+
+
 def _vscode_read_secret_named(secret_id: str) -> str | None:
     if not os.path.isfile(VSCODE_STATE_DB) or not os.path.isfile(VSCODE_LOCAL_STATE):
         return None
     try:
         aes_key = get_vscode_aes_key()
-        db = sqlite3.connect(f"file:{VSCODE_STATE_DB}?mode=ro", uri=True)
+        db = sqlite3.connect(_sqlite_readonly_uri(VSCODE_STATE_DB), uri=True)
         try:
             row = db.execute("SELECT value FROM ItemTable WHERE key=?", (f"secret://{secret_id}",)).fetchone()
         finally:
@@ -863,13 +1108,40 @@ def _vscode_read_secret() -> str | None:
     return _vscode_read_secret_named(VSCODE_SECRET_ID)
 
 
+def vscode_secret_storage_status() -> tuple[bool, str]:
+    if not os.path.isfile(VSCODE_STATE_DB) or not os.path.isfile(VSCODE_LOCAL_STATE):
+        return False, "没有找到 VS Code SecretStorage"
+    try:
+        get_vscode_aes_key()
+        db = sqlite3.connect(_sqlite_readonly_uri(VSCODE_STATE_DB), uri=True)
+        try:
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ItemTable'"
+            ).fetchone()
+            if not table:
+                return False, "VS Code SecretStorage 数据表不存在"
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                return False, "VS Code SecretStorage 数据库检查失败"
+        finally:
+            db.close()
+    except (OSError, RotationError, sqlite3.Error, KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return False, "当前无法安全访问 VS Code SecretStorage"
+    if not os.access(VSCODE_STATE_DB, os.W_OK):
+        return False, "VS Code SecretStorage 当前不可写"
+    return True, ""
+
+
 def _vscode_write_secret_named(secret_id: str, api_key: str):
     aes_key = get_vscode_aes_key()
     payload = json.dumps({"type": "Buffer", "data": list(vscode_secret_encrypt(api_key, aes_key))})
     db = sqlite3.connect(VSCODE_STATE_DB)
     try:
+        db.execute("PRAGMA busy_timeout=5000")
         db.execute("INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)", (f"secret://{secret_id}", payload))
         db.commit()
+        checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and checkpoint[0]:
+            raise RotationError("VS Code SecretStorage 仍被其他进程占用")
     finally:
         db.close()
 
@@ -912,16 +1184,34 @@ def _state(
     extension_versions: dict[str, str] | None = None,
     vscode_instances: list[dict] | None = None,
 ) -> TargetState:
-    title, location = TARGET_META[target_id]
+    title, location_label = TARGET_META[target_id]
+    location = {
+        "hermes": HERMES_CONFIG,
+        "continue": CONTINUE_CONFIG,
+        "dsh": DSH_SETTINGS,
+        "vscode": CHAT_LM_JSON,
+        "opencode_copilot": VSCODE_USER_SETTINGS,
+        "deepseek_copilot": VSCODE_USER_SETTINGS,
+        "mimo_copilot": VSCODE_USER_SETTINGS,
+        "claude": CLAUDE_SETTINGS,
+        "pi": PI_MODELS,
+    }.get(target_id, location_label)
     options = options if isinstance(options, dict) else {}
     try:
         if target_id == "hermes":
-            exists = os.path.isfile(HERMES_ENV) or os.path.isfile(HERMES_CONFIG)
+            installations = discover_hermes_installations()
+            exists = os.path.isfile(HERMES_ENV) or os.path.isfile(HERMES_CONFIG) or bool(installations)
             env = _read_text(HERMES_ENV) if os.path.isfile(HERMES_ENV) else ""
             config = _read_text(HERMES_CONFIG) if os.path.isfile(HERMES_CONFIG) else ""
             key = _env_get(env, "OPENAI_API_KEY") or _env_get(env, "OPENCODE_GO_API_KEY")
             url = _yaml_get(config, ("model", "base_url"))
-            discovery = [{"path": path, "source": "HERMES_HOME / 已知配置"} for path in (HERMES_CONFIG, HERMES_ENV) if os.path.isfile(path)]
+            discovery = [
+                *installations,
+                *[
+                    {"path": path, "source": "Hermes 用户配置"}
+                    for path in (HERMES_CONFIG, HERMES_ENV) if os.path.isfile(path)
+                ],
+            ]
         elif target_id == "continue":
             extension = extension_public(target_id, extension_versions, vscode_instances)
             exists = os.path.isfile(CONTINUE_CONFIG)
@@ -929,7 +1219,11 @@ def _state(
             url, key = _continue_values(config)
             discovery = ([{"path": CONTINUE_CONFIG, "source": "标准用户配置"}] if exists else [])
             if vscode_instances:
-                discovery = [*vscode_instances, *discovery]
+                extension_dirs = [
+                    {"path": str(root), "source": "VS Code 扩展目录"}
+                    for root in discover_vscode_extension_dirs(vscode_instances) if root.is_dir()
+                ]
+                discovery = [*vscode_instances, *extension_dirs, *discovery]
             if not extension["installed"]:
                 return TargetState(
                     target_id, title, CONTINUE_CONFIG, "missing-extension", "未安装",
@@ -998,10 +1292,18 @@ def _state(
             providers = _load_json(CHAT_LM_JSON, []) if exists else []
             provider = next((item for item in providers if isinstance(item, dict) and item.get("name") == "Key Router"), {})
             url = provider.get("url") if isinstance(provider, dict) else None
-            key = _vscode_read_secret() if exists else None
             discovery = [*instances]
+            if os.path.isfile(CHAT_LM_JSON):
+                discovery.append({"path": CHAT_LM_JSON, "source": "VS Code 自定义模型配置"})
             if os.path.isfile(VSCODE_STATE_DB):
                 discovery.append({"path": VSCODE_STATE_DB, "source": "VS Code 用户数据"})
+            capable, reason = vscode_secret_storage_status() if exists else (False, "")
+            if exists and not capable:
+                return TargetState(
+                    target_id, title, VSCODE_STATE_DB, "error", "不可写",
+                    reason, False, current_url=url, discovery=discovery,
+                )
+            key = _vscode_read_secret() if exists else None
         elif target_id in VSCODE_PLUGIN_CONFIG:
             extension = extension_public(target_id, extension_versions, vscode_instances)
             instances = vscode_instances if vscode_instances is not None else discover_vscode_installations()
@@ -1015,28 +1317,57 @@ def _state(
             config_key, secret_id = VSCODE_PLUGIN_CONFIG[target_id]
             settings = _load_jsonc(VSCODE_USER_SETTINGS, {}) if os.path.isfile(VSCODE_USER_SETTINGS) else {}
             url = settings.get(config_key) if isinstance(settings, dict) else None
-            key = _vscode_read_secret_named(secret_id) if exists else None
-            discovery = [*instances]
+            discovery = [
+                *instances,
+                *[
+                    {"path": str(root), "source": "VS Code 扩展目录"}
+                    for root in discover_vscode_extension_dirs(instances) if root.is_dir()
+                ],
+            ]
             if os.path.isfile(VSCODE_USER_SETTINGS):
                 discovery.append({"path": VSCODE_USER_SETTINGS, "source": "VS Code 用户设置"})
+            if os.path.isfile(VSCODE_STATE_DB):
+                discovery.append({"path": VSCODE_STATE_DB, "source": "VS Code 用户数据"})
+            capable, reason = vscode_secret_storage_status() if exists else (False, "")
+            if exists and not capable:
+                return TargetState(
+                    target_id, title, VSCODE_STATE_DB, "error", "不可写",
+                    reason, False, current_url=url, discovery=discovery, extension=extension,
+                )
+            key = _vscode_read_secret_named(secret_id) if exists else None
         elif target_id == "claude":
-            exists = Path(CLAUDE_SETTINGS).parent.is_dir() or os.path.isfile(CLAUDE_SETTINGS)
+            installations = discover_claude_installations()
+            exists = Path(CLAUDE_SETTINGS).parent.is_dir() or os.path.isfile(CLAUDE_SETTINGS) or bool(installations)
             settings = _load_json(CLAUDE_SETTINGS, {}) if exists else {}
             env = settings.get("env", {}) if isinstance(settings, dict) else {}
             url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
             key = (env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")) if isinstance(env, dict) else None
-            discovery = [{"path": CLAUDE_SETTINGS, "source": "标准用户配置"}] if exists else []
+            discovery = [*installations]
+            if os.path.isfile(CLAUDE_SETTINGS):
+                discovery.append({"path": CLAUDE_SETTINGS, "source": "Claude 用户配置"})
         else:
-            exists = Path(PI_SETTINGS).parent.is_dir() or os.path.isfile(PI_SETTINGS)
+            installations = discover_pi_installations()
+            exists = Path(PI_SETTINGS).parent.is_dir() or os.path.isfile(PI_SETTINGS) or bool(installations)
             settings = _load_jsonc(PI_SETTINGS, {}) if exists else {}
             provider_name = settings.get("defaultProvider") if isinstance(settings, dict) else None
             provider_name = provider_name if isinstance(provider_name, str) and provider_name else "anthropic"
             models = _load_jsonc(PI_MODELS, {}) if exists else {}
             providers = models.get("providers", {}) if isinstance(models, dict) else {}
             provider = providers.get(provider_name, {}) if isinstance(providers, dict) else {}
+            if exists and not provider:
+                return TargetState(
+                    target_id, title, PI_MODELS, "unconfigured", "需配置",
+                    "已找到 Pi，但没有可更新的模型提供商", False,
+                    discovery=[
+                        *installations,
+                        *([{"path": PI_MODELS, "source": "Pi 用户配置"}] if os.path.isfile(PI_MODELS) else []),
+                    ],
+                )
             url = provider.get("baseUrl") if isinstance(provider, dict) else None
             key = provider.get("apiKey") if isinstance(provider, dict) else None
-            discovery = [{"path": PI_MODELS, "source": "标准用户配置"}] if exists else []
+            discovery = [*installations]
+            if os.path.isfile(PI_MODELS):
+                discovery.append({"path": PI_MODELS, "source": "Pi 用户配置"})
 
         if not exists:
             return TargetState(
@@ -1202,13 +1533,16 @@ def _plan_claude(base_url: str, api_key: str, _options: dict | None = None, stat
     if not isinstance(env, dict):
         raise RotationError("Claude Code settings.json 的 env 必须是对象")
     env["ANTHROPIC_BASE_URL"] = base_url
-    if "ANTHROPIC_API_KEY" in env and "ANTHROPIC_AUTH_TOKEN" not in env:
-        env["ANTHROPIC_API_KEY"] = api_key
-    else:
+    if "ANTHROPIC_AUTH_TOKEN" in env and "ANTHROPIC_API_KEY" not in env:
         env["ANTHROPIC_AUTH_TOKEN"] = api_key
-        if "ANTHROPIC_API_KEY" in env:
-            env["ANTHROPIC_API_KEY"] = api_key
-    plan.changes.append(Change("claude", CLAUDE_SETTINGS, "ANTHROPIC_BASE_URL / 认证令牌", _json_dump(settings)))
+    else:
+        env["ANTHROPIC_API_KEY"] = api_key
+        if "ANTHROPIC_AUTH_TOKEN" in env:
+            env["ANTHROPIC_AUTH_TOKEN"] = api_key
+    updated = _json_dump(settings)
+    existing = _read_text(CLAUDE_SETTINGS) if os.path.isfile(CLAUDE_SETTINGS) else ""
+    if updated != existing:
+        plan.changes.append(Change("claude", CLAUDE_SETTINGS, "ANTHROPIC_BASE_URL / 认证令牌", updated))
     return plan
 
 
@@ -1228,7 +1562,16 @@ def _plan_pi(base_url: str, api_key: str, _options: dict | None = None, state: T
         raise RotationError("Pi 当前提供方配置必须是对象")
     provider["baseUrl"] = base_url
     provider["apiKey"] = api_key
-    plan.changes.append(Change("pi", PI_MODELS, f"providers.{provider_name}.baseUrl / apiKey", _json_dump(models)))
+    existing = _read_text(PI_MODELS) if os.path.isfile(PI_MODELS) else ""
+    updated = _jsonc_replace_nested_strings(
+        existing,
+        ("providers", provider_name),
+        {"baseUrl": base_url, "apiKey": api_key},
+    )
+    if updated is None:
+        updated = _json_dump(models)
+    if updated != existing:
+        plan.changes.append(Change("pi", PI_MODELS, f"providers.{provider_name}.baseUrl / apiKey", updated))
     return plan
 
 
@@ -1245,6 +1588,32 @@ PLANNERS = {
 }
 
 
+def _is_sqlite_config(path: str) -> bool:
+    return os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(VSCODE_STATE_DB))
+
+
+def _sqlite_snapshot(source: Path, destination: Path):
+    """使用 SQLite 在线备份 API，确保 WAL 中已提交的数据也进入备份。"""
+    source_db = sqlite3.connect(_sqlite_readonly_uri(source), uri=True)
+    destination_db = sqlite3.connect(str(destination))
+    try:
+        source_db.execute("PRAGMA busy_timeout=5000")
+        source_db.backup(destination_db)
+        if destination_db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RotationError("VS Code SecretStorage 备份校验失败")
+    finally:
+        destination_db.close()
+        source_db.close()
+    shutil.copystat(source, destination)
+
+
+def _clear_sqlite_sidecars(path: str):
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(path + suffix)
+        if sidecar.is_file():
+            sidecar.unlink()
+
+
 def _backup(paths: list[str]) -> tuple[str, dict[str, str | None]]:
     timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
     backup_dir = Path(BACKUP_DIR) / timestamp
@@ -1255,7 +1624,10 @@ def _backup(paths: list[str]) -> tuple[str, dict[str, str | None]]:
         source = Path(path)
         if source.is_file():
             backup_path = backup_dir / f"{index:02d}-{source.name}"
-            shutil.copy2(source, backup_path)
+            if _is_sqlite_config(path):
+                _sqlite_snapshot(source, backup_path)
+            else:
+                shutil.copy2(source, backup_path)
             mapping[path] = str(backup_path)
             manifest.append({"path": path, "backup": backup_path.name, "existed": True})
         else:
@@ -1266,12 +1638,22 @@ def _backup(paths: list[str]) -> tuple[str, dict[str, str | None]]:
 
 
 def _restore(mapping: dict[str, str | None]):
+    errors = []
     for path, backup_path in reversed(list(mapping.items())):
-        if backup_path:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(backup_path, path)
-        elif os.path.isfile(path):
-            os.unlink(path)
+        try:
+            if _is_sqlite_config(path):
+                _clear_sqlite_sidecars(path)
+            if backup_path:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup_path, path)
+            elif os.path.isfile(path):
+                os.unlink(path)
+            if _is_sqlite_config(path):
+                _clear_sqlite_sidecars(path)
+        except OSError as exc:
+            errors.append((path, exc))
+    if errors:
+        raise RotationError(f"有 {len(errors)} 个配置位置未能恢复") from errors[0][1]
 
 
 def run_rotation(

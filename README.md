@@ -33,18 +33,20 @@ VS Code 被选中时，请先完全退出 VS Code。界面支持日间、夜间�
 
 ## 自动发现
 
+- Hermes：读取 `HERMES_HOME` 或官方默认的 `~/.hermes`，并通过 PATH 与开始菜单确认程序；
 - dsh：优先读取 `DSH_HOME` 和 `~/.dsh/settings.yaml`，再通过 PATH、注册表和开始菜单快捷方式确认程序位置；
 - VS Code：通过 PATH、App Paths、常用目录和开始菜单快捷方式定位，即使程序装在 D 盘或 E 盘也可识别；
-- VS Code 扩展：读取用户扩展目录，并识别官方的 `VSCODE_EXTENSIONS` 自定义目录；
+- VS Code 扩展：读取用户扩展目录、`VSCODE_EXTENSIONS` 和快捷方式中的 `--extensions-dir`，同时忽略 `.obsolete` 中已卸载的残留目录；
+- Claude Code：读取 `CLAUDE_CONFIG_DIR` 或官方默认的 `~/.claude`；Pi 使用 `~/.pi/agent`；
 - 自动发现只检查明确线索，不默认递归扫描整个磁盘；找不到 dsh 配置时可由用户手动选择 `settings.yaml`。
 
 ## 安全设计
 
 - 默认只预览，不直接写入；
-- 每次应用前自动备份；
+- 每次应用前自动备份；VS Code 的 WAL 数据库使用一致性快照；
 - 写入失败自动恢复；
 - 页面和日志不显示完整 Key；
-- 只监听 `127.0.0.1`，并使用会话令牌与一次性预览令牌；
+- 只监听 `127.0.0.1`，校验 Host / Origin，并使用会话令牌与一次性预览令牌；
 - VS Code 的 API Key 写入 Windows 加密的 SecretStorage。
 - 扩展安装接口只接受内置白名单 ID，不能执行任意命令。
 
@@ -77,6 +79,12 @@ python web_app.py --smoke-test
 node --check ui\app.js
 pip install -r requirements-build.txt
 pyinstaller key-rotator.spec --clean
+```
+
+打包后还可运行隔离写入验收：
+
+```powershell
+python tests\package_e2e.py dist\Key-Router.exe
 ```
 
 单文件产物：`dist/Key-Router.exe`。
