@@ -53,6 +53,9 @@ def encoded_secret(value: str, aes_key: bytes) -> str:
 def file_hash(path: Path) -> str:
     if not path.exists():
         return "<missing>"
+    if path.is_dir():
+        listing = "\n".join(sorted(str(item.relative_to(path)) for item in path.rglob("*")))
+        return "<dir>" + hashlib.sha256(listing.encode("utf-8")).hexdigest()
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -68,11 +71,14 @@ class RotationFlowTest(unittest.TestCase):
             "DSH_CREDENTIALS": self.root / "dsh" / ".credentials.yaml",
             "VSCODE_STATE_DB": self.root / "vscode" / "state.vscdb",
             "VSCODE_LOCAL_STATE": self.root / "vscode" / "Local State",
+            "VSCODE_USER_SETTINGS": self.root / "vscode" / "settings.json",
+            "VSCODE_EXTENSIONS_DIR": self.root / "vscode" / "extensions",
             "CHAT_LM_JSON": self.root / "vscode" / "chatLanguageModels.json",
             "CLAUDE_SETTINGS": self.root / "claude" / "settings.json",
             "PI_SETTINGS": self.root / "pi" / "settings.json",
             "PI_MODELS": self.root / "pi" / "models.json",
             "BACKUP_DIR": self.root / "backups",
+            "APP_SETTINGS": self.root / "app-settings.json",
         }
         self.originals = {}
         for name, path in self.paths.items():
@@ -93,6 +99,8 @@ class RotationFlowTest(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
 
     def _create_fixture(self):
+        for metadata in core.EXTENSION_META.values():
+            (self.paths["VSCODE_EXTENSIONS_DIR"] / f"{metadata['id'].lower()}-1.0.0").mkdir(parents=True)
         self._write("HERMES_ENV", f"OPENCODE_GO_API_KEY={OLD_KEY}\nOTHER_SETTING=keep\n")
         self._write(
             "CONTINUE_CONFIG",
@@ -138,6 +146,17 @@ agent-default-model:
             "CHAT_LM_JSON",
             json.dumps([{"name": "Existing", "vendor": "openai", "apiKey": "keep"}]),
         )
+        self._write(
+            "VSCODE_USER_SETTINGS",
+            f"""{{
+  // comments must survive
+  "opencodego.apiBaseUrl": "{OLD_URL}",
+  "deepseek-copilot.baseUrl": "{OLD_URL}",
+  "mimo-copilot.baseUrl": "{OLD_URL}",
+  "editor.fontSize": 14,
+}}
+""",
+        )
         db = sqlite3.connect(self.paths["VSCODE_STATE_DB"])
         try:
             db.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
@@ -145,6 +164,11 @@ agent-default-model:
                 "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
                 (OTHER_SECRET, encoded_secret(OTHER_KEY, aes_key)),
             )
+            for _config_key, secret_id in core.VSCODE_PLUGIN_CONFIG.values():
+                db.execute(
+                    "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+                    (f"secret://{secret_id}", encoded_secret(OLD_KEY, aes_key)),
+                )
             db.commit()
         finally:
             db.close()
@@ -184,7 +208,7 @@ agent-default-model:
             db.close()
         return core.vscode_secret_decrypt(bytes(json.loads(row[0])["data"]), self.aes_key)
 
-    def test_detection_lists_six_selectable_targets_without_raw_keys(self):
+    def test_detection_lists_all_selectable_targets_without_raw_keys(self):
         items = core.detect_targets()
         self.assertEqual([item["id"] for item in items], list(core.TARGET_ORDER))
         self.assertTrue(all(item["selectable"] for item in items))
@@ -192,6 +216,7 @@ agent-default-model:
         self.assertNotIn(OLD_KEY, rendered)
         self.assertIn("Claude Code", rendered)
         self.assertIn("Pi", rendered)
+        self.assertIn("ltmoerdani.opencode-copilot-chat", rendered)
 
     def test_dry_run_is_read_only_and_logs_are_masked(self):
         tracked = list(self.paths.values())
@@ -241,6 +266,13 @@ agent-default-model:
         self.assertEqual(self._decrypt(core.VSCODE_SECRET_KEY), NEW_KEY)
         self.assertEqual(self._decrypt(OTHER_SECRET), OTHER_KEY)
 
+        vscode_settings_text = self.paths["VSCODE_USER_SETTINGS"].read_text(encoding="utf-8")
+        self.assertIn("// comments must survive", vscode_settings_text)
+        vscode_settings = json.loads(core._strip_jsonc(vscode_settings_text))
+        for config_key, secret_id in core.VSCODE_PLUGIN_CONFIG.values():
+            self.assertEqual(vscode_settings[config_key], NEW_URL)
+            self.assertEqual(self._decrypt(f"secret://{secret_id}"), NEW_KEY)
+
         claude = json.loads(self.paths["CLAUDE_SETTINGS"].read_text(encoding="utf-8"))
         self.assertEqual(claude["env"]["ANTHROPIC_BASE_URL"], NEW_URL)
         self.assertEqual(claude["env"]["ANTHROPIC_AUTH_TOKEN"], NEW_KEY)
@@ -270,6 +302,51 @@ agent-default-model:
         after = {path: file_hash(path) for path in tracked}
         self.assertEqual(before, after)
 
+    def test_dsh_manual_path_and_provider_are_used_without_drive_scan(self):
+        manual = self.root / "portable-dsh" / "settings.yaml"
+        manual.parent.mkdir(parents=True)
+        manual.write_text(
+            f"""llm-pi-ai:
+  providers:
+    route-a:
+      apiKeyEnv: ROUTE_A_KEY
+      baseURL: {OLD_URL}
+    route-b:
+      apiKeyEnv: ROUTE_B_KEY
+      baseURL: https://second.example/v1
+agent-default-model:
+  provider: route-a
+""",
+            encoding="utf-8",
+        )
+        (manual.parent / ".credentials.yaml").write_text(
+            f"refs:\n  ROUTE_A_KEY: {OLD_KEY}\n  ROUTE_B_KEY: {OTHER_KEY}\n",
+            encoding="utf-8",
+        )
+        options = {"dsh": {"settingsPath": str(manual), "provider": "route-b"}}
+        state = core._state("dsh", options["dsh"])
+        self.assertTrue(state.selectable)
+        self.assertEqual(state.location, str(manual))
+        self.assertEqual(state.selected_provider, "route-b")
+        result = core.run_rotation(
+            NEW_URL, NEW_KEY, ["dsh"], target_options=options, apply=False, log=None
+        )
+        self.assertTrue(all(change["path"].startswith(str(manual.parent)) for change in result["changes"]))
+        self.assertNotIn(NEW_URL, manual.read_text(encoding="utf-8"))
+
+    def test_missing_extension_exposes_identity_and_install_is_whitelisted(self):
+        missing_id = core.EXTENSION_META["opencode_copilot"]["id"].lower()
+        for directory in self.paths["VSCODE_EXTENSIONS_DIR"].iterdir():
+            if directory.name.lower().startswith(missing_id + "-"):
+                directory.rmdir()
+        item = next(row for row in core.detect_targets() if row["id"] == "opencode_copilot")
+        self.assertFalse(item["selectable"])
+        self.assertEqual(item["badge"], "未安装")
+        self.assertEqual(item["extension"]["id"], "ltmoerdani.opencode-copilot-chat")
+        self.assertEqual(item["extension"]["publisher"], "ltmoerdani")
+        with self.assertRaises(core.RotationError):
+            core.install_vscode_extension("unknown.publisher-extension")
+
     def test_validation_accepts_non_sk_key_and_blocks_unsafe_urls(self):
         self.assertEqual(core.validate_key("token-1234"), "token-1234")
         self.assertEqual(core.validate_base_url("http://127.0.0.1:11434/v1/"), "http://127.0.0.1:11434/v1")
@@ -277,6 +354,10 @@ agent-default-model:
             core.validate_base_url("http://remote.example.com/v1")
         with self.assertRaises(core.RotationError):
             core.validate_base_url("https://example.com/v1?token=secret")
+        settings = '{\n  "editor.fontSize": 14 // keep this comment\n}\n'
+        updated = core._jsonc_set_top_level(settings, "demo.baseUrl", NEW_URL)
+        self.assertEqual(json.loads(core._strip_jsonc(updated))["demo.baseUrl"], NEW_URL)
+        self.assertIn("// keep this comment", updated)
 
 
 if __name__ == "__main__":

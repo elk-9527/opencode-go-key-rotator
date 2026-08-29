@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from typing import Callable
@@ -32,7 +33,9 @@ class RotationError(RuntimeError):
 def _paths() -> dict[str, str]:
     home = Path.home()
     appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+    localappdata = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
     hermes_home = Path(os.environ.get("HERMES_HOME") or r"E:\Program Files\Hermes")
+    app_home = localappdata / "Key Router"
     paths = {
         "HERMES_ENV": str(hermes_home / ".env"),
         "HERMES_CONFIG": str(hermes_home / "config.yaml"),
@@ -41,11 +44,14 @@ def _paths() -> dict[str, str]:
         "DSH_CREDENTIALS": str(home / ".dsh" / ".credentials.yaml"),
         "VSCODE_STATE_DB": str(appdata / "Code" / "User" / "globalStorage" / "state.vscdb"),
         "VSCODE_LOCAL_STATE": str(appdata / "Code" / "Local State"),
+        "VSCODE_USER_SETTINGS": str(appdata / "Code" / "User" / "settings.json"),
+        "VSCODE_EXTENSIONS_DIR": str(Path(os.environ.get("VSCODE_EXTENSIONS") or home / ".vscode" / "extensions")),
         "CHAT_LM_JSON": str(appdata / "Code" / "User" / "chatLanguageModels.json"),
         "CLAUDE_SETTINGS": str(home / ".claude" / "settings.json"),
         "PI_SETTINGS": str(home / ".pi" / "agent" / "settings.json"),
         "PI_MODELS": str(home / ".pi" / "agent" / "models.json"),
-        "BACKUP_DIR": str(Path(__file__).resolve().parent / "backups"),
+        "BACKUP_DIR": str(app_home / "backups"),
+        "APP_SETTINGS": str(app_home / "settings.json"),
     }
     override = os.environ.get("RK_PATHS_JSON")
     if override:
@@ -56,15 +62,53 @@ def _paths() -> dict[str, str]:
 PATHS = _paths()
 globals().update(PATHS)
 
-TARGET_ORDER = ("hermes", "continue", "dsh", "vscode", "claude", "pi")
+TARGET_ORDER = (
+    "hermes", "continue", "dsh", "vscode",
+    "opencode_copilot", "deepseek_copilot", "mimo_copilot",
+    "claude", "pi",
+)
 TARGET_META = {
     "hermes": ("Hermes", "config.yaml + .env"),
     "continue": ("Continue", "~/.continue/config.yaml"),
     "dsh": ("dsh", "~/.dsh/settings.yaml"),
-    "vscode": ("VS Code", "Custom Endpoint + SecretStorage"),
+    "vscode": ("VS Code 自定义端点", "Custom Endpoint + SecretStorage"),
+    "opencode_copilot": ("OpenCode for Copilot", "VS Code 扩展设置 + SecretStorage"),
+    "deepseek_copilot": ("DeepSeek for Copilot", "VS Code 扩展设置 + SecretStorage"),
+    "mimo_copilot": ("Xiaomi MiMo for Copilot", "VS Code 扩展设置 + SecretStorage"),
     "claude": ("Claude Code", "~/.claude/settings.json"),
     "pi": ("Pi", "~/.pi/agent/models.json"),
 }
+
+EXTENSION_META = {
+    "continue": {
+        "id": "continue.continue",
+        "name": "Continue - open-source AI code agent",
+        "publisher": "Continue",
+    },
+    "opencode_copilot": {
+        "id": "ltmoerdani.opencode-copilot-chat",
+        "name": "OpenCode for Copilot Chat — BYOK 30+ AI Models",
+        "publisher": "ltmoerdani",
+    },
+    "deepseek_copilot": {
+        "id": "vizards.deepseek-v4-for-copilot",
+        "name": "DeepSeek V4 for Copilot Chat",
+        "publisher": "Vizards",
+    },
+    "mimo_copilot": {
+        "id": "sdmapvstool.xiaomimimo-for-copilot",
+        "name": "Xiaomi MiMo for Copilot Chat",
+        "publisher": "sdmapvstool",
+    },
+}
+
+VSCODE_PLUGIN_CONFIG = {
+    "opencode_copilot": ("opencodego.apiBaseUrl", "opencodego.apiKey"),
+    "deepseek_copilot": ("deepseek-copilot.baseUrl", "deepseek-copilot.apiKey"),
+    "mimo_copilot": ("mimo-copilot.baseUrl", "mimo-copilot.apiKey"),
+}
+VSCODE_TARGETS = {"vscode", *VSCODE_PLUGIN_CONFIG}
+VSCODE_DISCOVERY_TARGETS = {"continue", *VSCODE_TARGETS}
 
 VSCODE_SECRET_ID = "chat.lm.secret.key-router-api-key"
 VSCODE_SECRET_KEY = f"secret://{VSCODE_SECRET_ID}"
@@ -83,6 +127,11 @@ class TargetState:
     current_url: str | None = None
     current_key: str | None = None
     note: str = ""
+    discovery: list[dict] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    providers: list[dict] = field(default_factory=list)
+    selected_provider: str = ""
+    extension: dict | None = None
 
     def public(self) -> dict:
         return {
@@ -94,6 +143,11 @@ class TargetState:
             "detail": self.detail,
             "selectable": self.selectable,
             "note": self.note,
+            "discovery": self.discovery,
+            "candidates": self.candidates,
+            "providers": self.providers,
+            "selectedProvider": self.selected_provider,
+            "extension": self.extension,
         }
 
 
@@ -117,6 +171,321 @@ class TargetPlan:
     target: TargetState
     changes: list[Change] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def _creation_flags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _dedupe_discovery(items: list[dict]) -> list[dict]:
+    seen = set()
+    output = []
+    for item in items:
+        raw = str(item.get("path") or "").strip().strip('"')
+        if not raw:
+            continue
+        key = os.path.normcase(os.path.normpath(raw))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append({**item, "path": raw})
+    return output
+
+
+def _shortcut_targets(name_pattern: str) -> list[dict]:
+    """从开始菜单快捷方式取得真实目标；不会扫描磁盘。"""
+    if os.name != "nt":
+        return []
+    script = r"""
+$roots = @(
+  [Environment]::GetFolderPath('StartMenu'),
+  [Environment]::GetFolderPath('CommonStartMenu')
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+$shell = New-Object -ComObject WScript.Shell
+$rows = foreach ($root in $roots) {
+  Get-ChildItem -LiteralPath $root -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match $env:KEY_ROUTER_SHORTCUT_PATTERN } |
+    ForEach-Object {
+      $shortcut = $shell.CreateShortcut($_.FullName)
+      if ($shortcut.TargetPath) {
+        [pscustomobject]@{ path = $shortcut.TargetPath; shortcut = $_.FullName }
+      }
+    }
+}
+@($rows) | ConvertTo-Json -Compress
+"""
+    environment = os.environ.copy()
+    environment["KEY_ROUTER_SHORTCUT_PATTERN"] = name_pattern
+    powershell = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    try:
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=6, env=environment,
+            creationflags=_creation_flags(),
+        )
+        if result.returncode or not result.stdout.strip():
+            return []
+        payload = json.loads(result.stdout)
+        rows = payload if isinstance(payload, list) else [payload]
+        return [
+            {"path": row.get("path", ""), "source": "开始菜单快捷方式", "detail": row.get("shortcut", "")}
+            for row in rows if isinstance(row, dict)
+        ]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
+def _registry_app_paths(executable_name: str) -> list[dict]:
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    output = []
+    subkey = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"
+    for hive, label in ((winreg.HKEY_CURRENT_USER, "用户注册表"), (winreg.HKEY_LOCAL_MACHINE, "系统注册表")):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _kind = winreg.QueryValueEx(key, None)
+                output.append({"path": str(value), "source": label})
+        except OSError:
+            continue
+    return output
+
+
+def _registry_uninstall_matches(pattern: str) -> list[dict]:
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    output = []
+    roots = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    for hive, path in roots:
+        try:
+            with winreg.OpenKey(hive, path) as root:
+                for index in range(winreg.QueryInfoKey(root)[0]):
+                    try:
+                        with winreg.OpenKey(root, winreg.EnumKey(root, index)) as key:
+                            name = str(winreg.QueryValueEx(key, "DisplayName")[0])
+                            if not re.search(pattern, name, re.I):
+                                continue
+                            values = {}
+                            for field_name in ("InstallLocation", "DisplayIcon"):
+                                try:
+                                    values[field_name] = str(winreg.QueryValueEx(key, field_name)[0])
+                                except OSError:
+                                    pass
+                            raw = values.get("InstallLocation") or values.get("DisplayIcon") or ""
+                            raw = raw.split(",", 1)[0].strip().strip('"')
+                            if raw:
+                                output.append({"path": raw, "source": "卸载注册表", "detail": name})
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return output
+
+
+def discover_dsh_installations() -> list[dict]:
+    items: list[dict] = []
+    for command in ("dsh", "dsh.cmd", "dsh.exe"):
+        located = shutil.which(command)
+        if located:
+            items.append({"path": located, "source": "PATH 命令"})
+    for environment_name in ("DSH_EXE", "DSH_INSTALL_DIR"):
+        raw = os.environ.get(environment_name)
+        if raw:
+            items.append({"path": raw, "source": f"环境变量 {environment_name}"})
+    local = Path(os.environ.get("LOCALAPPDATA") or "")
+    program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+    for candidate in (
+        local / "Programs" / "DSH Desktop" / "DSH Desktop.exe",
+        program_files / "DSH Desktop" / "DSH Desktop.exe",
+    ):
+        if candidate.is_file():
+            items.append({"path": str(candidate), "source": "常用安装目录"})
+    items.extend(_registry_app_paths("DSH Desktop.exe"))
+    items.extend(_registry_uninstall_matches(r"\bDSH\b|DeepSeek Harness"))
+    items.extend(_shortcut_targets(r"(^|\s)DSH( Desktop)?($|\s)|DeepSeek Harness"))
+    return _dedupe_discovery(items)
+
+
+def _dsh_provider_rows(settings_text: str) -> list[dict]:
+    current = _yaml_get(settings_text, ("agent-default-model", "provider")) or ""
+    rows = []
+    for provider_id in _yaml_child_keys(settings_text, ("llm-pi-ai", "providers")):
+        prefix = ("llm-pi-ai", "providers", provider_id)
+        rows.append({
+            "id": provider_id,
+            "name": _yaml_get(settings_text, prefix + ("displayName",)) or provider_id,
+            "baseUrl": _yaml_get(settings_text, prefix + ("baseURL",)) or "",
+            "apiKeyEnv": _yaml_get(settings_text, prefix + ("apiKeyEnv",)) or "",
+            "current": provider_id == current,
+            "writable": bool(_yaml_get(settings_text, prefix + ("apiKeyEnv",))),
+        })
+    return rows
+
+
+def discover_dsh_configs(extra_path: str | None = None) -> list[dict]:
+    candidates: list[dict] = []
+    requested = []
+    if extra_path:
+        manual = Path(extra_path).expanduser()
+        if manual.name.lower() == "settings.yaml":
+            requested.append((manual, "手动选择"))
+    dsh_home = os.environ.get("DSH_HOME")
+    if dsh_home:
+        requested.append((Path(dsh_home).expanduser() / "settings.yaml", "环境变量 DSH_HOME"))
+    requested.append((Path(DSH_SETTINGS), "默认用户配置"))
+    standard = Path.home() / ".dsh" / "settings.yaml"
+    requested.append((standard, "标准用户目录"))
+    for path, source in requested:
+        if not path.is_file():
+            continue
+        try:
+            text = _read_text(str(path))
+            providers = _dsh_provider_rows(text)
+        except OSError:
+            continue
+        candidates.append({
+            "path": str(path),
+            "credentialsPath": str(path.parent / ".credentials.yaml"),
+            "source": source,
+            "providers": providers,
+            "currentProvider": next((row["id"] for row in providers if row["current"]), ""),
+        })
+    return _dedupe_discovery(candidates)
+
+
+def discover_vscode_installations() -> list[dict]:
+    items: list[dict] = []
+    for command in ("code", "code.cmd", "Code.exe"):
+        located = shutil.which(command)
+        if located:
+            items.append({"path": located, "source": "PATH 命令"})
+    local = Path(os.environ.get("LOCALAPPDATA") or "")
+    program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)")
+    for candidate in (
+        local / "Programs" / "Microsoft VS Code" / "Code.exe",
+        program_files / "Microsoft VS Code" / "Code.exe",
+        program_files_x86 / "Microsoft VS Code" / "Code.exe",
+    ):
+        if candidate.is_file():
+            items.append({"path": str(candidate), "source": "常用安装目录"})
+    items.extend(_registry_app_paths("Code.exe"))
+    items.extend(_shortcut_targets(r"Visual Studio Code|^VS Code$"))
+    normalized = []
+    for item in _dedupe_discovery(items):
+        path = Path(item["path"])
+        executable = path
+        cli = path
+        if path.name.lower() in {"code", "code.cmd"}:
+            possible = path.parent.parent / "Code.exe"
+            if possible.is_file():
+                executable = possible
+        else:
+            possible = path.parent / "bin" / "code.cmd"
+            if possible.is_file():
+                cli = possible
+        normalized.append({**item, "path": str(executable), "cli": str(cli)})
+    return _dedupe_discovery(normalized)
+
+
+def installed_vscode_extensions(
+    instances: list[dict] | None = None,
+    *,
+    query_cli: bool = False,
+) -> dict[str, str]:
+    installed: dict[str, str] = {}
+    root = Path(VSCODE_EXTENSIONS_DIR)
+    if root.is_dir():
+        for directory in root.iterdir():
+            if not directory.is_dir():
+                continue
+            lower = directory.name.lower()
+            for metadata in EXTENSION_META.values():
+                extension_id = metadata["id"].lower()
+                if lower == extension_id or lower.startswith(extension_id + "-"):
+                    version = directory.name[len(extension_id):].lstrip("-")
+                    installed[extension_id] = version or "已安装"
+    vscode = instances if instances is not None else discover_vscode_installations()
+    if query_cli and vscode:
+        executable = vscode[0]["path"]
+        try:
+            result = subprocess.run(
+                [executable, "--list-extensions", "--show-versions"],
+                capture_output=True, text=True, timeout=12, creationflags=_creation_flags(),
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    extension_id, _separator, version = line.strip().partition("@")
+                    if extension_id:
+                        installed[extension_id.lower()] = version or "已安装"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return installed
+
+
+def extension_public(
+    target_id: str,
+    installed: dict[str, str] | None = None,
+    vscode_instances: list[dict] | None = None,
+) -> dict | None:
+    metadata = EXTENSION_META.get(target_id)
+    if not metadata:
+        return None
+    versions = installed if installed is not None else installed_vscode_extensions()
+    version = versions.get(metadata["id"].lower(), "")
+    vscode = vscode_instances if vscode_instances is not None else discover_vscode_installations()
+    return {
+        **metadata,
+        "installed": bool(version),
+        "version": version,
+        "installable": bool(vscode),
+    }
+
+
+def install_vscode_extension(extension_id: str) -> dict:
+    """仅安装白名单中的 VS Code 扩展；调用前应由界面取得用户确认。"""
+    allowed = {metadata["id"].lower(): metadata for metadata in EXTENSION_META.values()}
+    metadata = allowed.get(extension_id.lower())
+    if not metadata:
+        raise RotationError("该扩展不在 Key Router 的安装白名单中")
+    instances = discover_vscode_installations()
+    if not instances:
+        raise RotationError("没有找到 VS Code，无法安装扩展")
+    executable = instances[0]["path"]
+    try:
+        result = subprocess.run(
+            [executable, "--install-extension", metadata["id"], "--force"],
+            capture_output=True, text=True, timeout=180, creationflags=_creation_flags(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RotationError("扩展安装超时，请检查网络或 VS Code 代理设置") from exc
+    except OSError as exc:
+        raise RotationError("无法启动 VS Code 扩展安装程序") from exc
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode != 0:
+        short = output.splitlines()[-1] if output else f"退出码 {result.returncode}"
+        raise RotationError(f"扩展安装失败：{short[:300]}")
+    versions = installed_vscode_extensions(instances, query_cli=True)
+    version = versions.get(metadata["id"].lower(), "")
+    if not version:
+        raise RotationError("VS Code 报告安装完成，但重新检测时没有找到该扩展")
+    return {
+        "id": metadata["id"],
+        "name": metadata["name"],
+        "publisher": metadata["publisher"],
+        "version": version,
+    }
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -276,6 +645,31 @@ def _load_jsonc(path: str, default):
         return json.loads(_strip_jsonc(_read_text(path)))
     except (OSError, json.JSONDecodeError) as exc:
         raise RotationError(f"配置文件无法解析：{Path(path).name}") from exc
+
+
+def _jsonc_set_top_level(text: str, key: str, value: str) -> str:
+    """只更新 VS Code settings.json 的一个顶层字符串字段，并保留其余文本。"""
+    source = text if text.strip() else "{}\n"
+    parsed = json.loads(_strip_jsonc(source))
+    if not isinstance(parsed, dict):
+        raise RotationError("VS Code settings.json 顶层必须是对象")
+    encoded_key = json.dumps(key, ensure_ascii=False)
+    encoded_value = json.dumps(value, ensure_ascii=False)
+    pattern = re.compile(rf'({re.escape(encoded_key)}\s*:\s*)"(?:\\.|[^"\\])*"')
+    if pattern.search(source):
+        return pattern.sub(lambda match: match.group(1) + encoded_value, source, count=1)
+    open_index = source.find("{")
+    if open_index < 0:
+        raise RotationError("VS Code settings.json 缺少开始括号")
+    newline = "\r\n" if "\r\n" in source else "\n"
+    rest = source[open_index + 1:]
+    if rest.startswith("\r\n"):
+        rest = rest[2:]
+    elif rest.startswith("\n"):
+        rest = rest[1:]
+    comma = "," if parsed else ""
+    insertion = f"{newline}  {encoded_key}: {encoded_value}{comma}{newline}"
+    return source[:open_index + 1] + insertion + rest
 
 
 def _unquote_yaml(value: str | None) -> str | None:
@@ -446,30 +840,42 @@ def _continue_set(text: str, base_url: str, api_key: str) -> str:
     return "".join(lines)
 
 
-def _vscode_read_secret() -> str | None:
+def _vscode_read_secret_named(secret_id: str) -> str | None:
     if not os.path.isfile(VSCODE_STATE_DB) or not os.path.isfile(VSCODE_LOCAL_STATE):
         return None
-    aes_key = get_vscode_aes_key()
-    db = sqlite3.connect(f"file:{VSCODE_STATE_DB}?mode=ro", uri=True)
     try:
-        row = db.execute("SELECT value FROM ItemTable WHERE key=?", (VSCODE_SECRET_KEY,)).fetchone()
-    finally:
-        db.close()
-    if not row:
+        aes_key = get_vscode_aes_key()
+        db = sqlite3.connect(f"file:{VSCODE_STATE_DB}?mode=ro", uri=True)
+        try:
+            row = db.execute("SELECT value FROM ItemTable WHERE key=?", (f"secret://{secret_id}",)).fetchone()
+        finally:
+            db.close()
+        if not row:
+            return None
+        payload = json.loads(row[0])
+        return vscode_secret_decrypt(bytes(payload["data"]), aes_key)
+    except (OSError, RotationError, sqlite3.Error, KeyError, TypeError, json.JSONDecodeError):
+        # 新版 VS Code 或沙箱环境可能暂时无法解密；检测仍可继续，写入时再给出明确错误。
         return None
-    payload = json.loads(row[0])
-    return vscode_secret_decrypt(bytes(payload["data"]), aes_key)
 
 
-def _vscode_write_secret(api_key: str):
+def _vscode_read_secret() -> str | None:
+    return _vscode_read_secret_named(VSCODE_SECRET_ID)
+
+
+def _vscode_write_secret_named(secret_id: str, api_key: str):
     aes_key = get_vscode_aes_key()
     payload = json.dumps({"type": "Buffer", "data": list(vscode_secret_encrypt(api_key, aes_key))})
     db = sqlite3.connect(VSCODE_STATE_DB)
     try:
-        db.execute("INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)", (VSCODE_SECRET_KEY, payload))
+        db.execute("INSERT OR REPLACE INTO ItemTable(key, value) VALUES (?, ?)", (f"secret://{secret_id}", payload))
         db.commit()
     finally:
         db.close()
+
+
+def _vscode_write_secret(api_key: str):
+    _vscode_write_secret_named(VSCODE_SECRET_ID, api_key)
 
 
 def vscode_running() -> bool:
@@ -499,8 +905,15 @@ def _detail(current_url: str | None, current_key: str | None, fallback: str) -> 
     return fallback
 
 
-def _state(target_id: str) -> TargetState:
+def _state(
+    target_id: str,
+    options: dict | None = None,
+    *,
+    extension_versions: dict[str, str] | None = None,
+    vscode_instances: list[dict] | None = None,
+) -> TargetState:
     title, location = TARGET_META[target_id]
+    options = options if isinstance(options, dict) else {}
     try:
         if target_id == "hermes":
             exists = os.path.isfile(HERMES_ENV) or os.path.isfile(HERMES_CONFIG)
@@ -508,37 +921,111 @@ def _state(target_id: str) -> TargetState:
             config = _read_text(HERMES_CONFIG) if os.path.isfile(HERMES_CONFIG) else ""
             key = _env_get(env, "OPENAI_API_KEY") or _env_get(env, "OPENCODE_GO_API_KEY")
             url = _yaml_get(config, ("model", "base_url"))
+            discovery = [{"path": path, "source": "HERMES_HOME / 已知配置"} for path in (HERMES_CONFIG, HERMES_ENV) if os.path.isfile(path)]
         elif target_id == "continue":
+            extension = extension_public(target_id, extension_versions, vscode_instances)
             exists = os.path.isfile(CONTINUE_CONFIG)
             config = _read_text(CONTINUE_CONFIG) if exists else ""
             url, key = _continue_values(config)
+            discovery = ([{"path": CONTINUE_CONFIG, "source": "标准用户配置"}] if exists else [])
+            if vscode_instances:
+                discovery = [*vscode_instances, *discovery]
+            if not extension["installed"]:
+                return TargetState(
+                    target_id, title, CONTINUE_CONFIG, "missing-extension", "未安装",
+                    f"缺少扩展 · {extension['id']}", False,
+                    extension=extension,
+                    discovery=vscode_instances or discover_vscode_installations(),
+                )
             if exists and not _continue_block(config):
-                return TargetState(target_id, title, location, "unsupported", "需配置", "没有 models 配置", False)
+                return TargetState(
+                    target_id, title, CONTINUE_CONFIG, "unsupported", "需配置",
+                    "没有可更新的 models 配置", False, extension=extension,
+                    discovery=discovery,
+                )
         elif target_id == "dsh":
-            exists = os.path.isfile(DSH_SETTINGS)
-            settings = _read_text(DSH_SETTINGS) if exists else ""
-            provider = _yaml_get(settings, ("agent-default-model", "provider"))
-            if not provider:
-                providers = _yaml_child_keys(settings, ("llm-pi-ai", "providers"))
-                provider = providers[0] if providers else None
-            if exists and not provider:
-                return TargetState(target_id, title, location, "unsupported", "需配置", "没有可用提供方", False)
-            url = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "baseURL")) if provider else None
-            env_name = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "apiKeyEnv")) if provider else None
-            credentials = _read_text(DSH_CREDENTIALS) if os.path.isfile(DSH_CREDENTIALS) else ""
+            installations = discover_dsh_installations()
+            selected_path = str(options.get("settingsPath") or "")
+            candidates = discover_dsh_configs(selected_path or None)
+            selected = next(
+                (item for item in candidates if selected_path and os.path.normcase(item["path"]) == os.path.normcase(selected_path)),
+                candidates[0] if candidates else None,
+            )
+            if not selected:
+                detail = "已找到程序，但没有找到 settings.yaml" if installations else "没有找到程序或用户配置"
+                return TargetState(
+                    target_id, title,
+                    installations[0]["path"] if installations else location,
+                    "unconfigured" if installations else "missing",
+                    "未配置" if installations else "未发现",
+                    detail, False,
+                    discovery=installations,
+                    candidates=candidates,
+                )
+            settings_path = selected["path"]
+            credentials_path = selected["credentialsPath"]
+            settings = _read_text(settings_path)
+            providers = selected["providers"]
+            requested_provider = str(options.get("provider") or "")
+            provider = next((row for row in providers if row["id"] == requested_provider), None)
+            if provider is None:
+                provider = next((row for row in providers if row["current"] and row["writable"]), None)
+            if provider is None:
+                provider = next((row for row in providers if row["writable"]), None)
+            if provider is None:
+                return TargetState(
+                    target_id, title, settings_path, "unsupported", "需配置",
+                    "找到配置，但没有带 apiKeyEnv 的可写提供商", False,
+                    discovery=[*installations, {"path": settings_path, "source": selected["source"]}],
+                    candidates=candidates, providers=providers,
+                )
+            url = provider["baseUrl"] or None
+            env_name = provider["apiKeyEnv"]
+            credentials = _read_text(credentials_path) if os.path.isfile(credentials_path) else ""
             key = _yaml_get(credentials, ("refs", env_name)) if env_name else None
+            return TargetState(
+                target_id, title, settings_path,
+                "ok" if (url or key) else "ready",
+                "已配置" if (url or key) else "可写入",
+                _detail(url, key, f"将更新提供商 {provider['id']}"),
+                True, url, key,
+                discovery=[*installations, {"path": settings_path, "source": selected["source"]}],
+                candidates=candidates, providers=providers, selected_provider=provider["id"],
+            )
         elif target_id == "vscode":
+            instances = vscode_instances if vscode_instances is not None else discover_vscode_installations()
             exists = os.path.isfile(VSCODE_STATE_DB) and os.path.isfile(VSCODE_LOCAL_STATE)
             providers = _load_json(CHAT_LM_JSON, []) if exists else []
             provider = next((item for item in providers if isinstance(item, dict) and item.get("name") == "Key Router"), {})
             url = provider.get("url") if isinstance(provider, dict) else None
             key = _vscode_read_secret() if exists else None
+            discovery = [*instances]
+            if os.path.isfile(VSCODE_STATE_DB):
+                discovery.append({"path": VSCODE_STATE_DB, "source": "VS Code 用户数据"})
+        elif target_id in VSCODE_PLUGIN_CONFIG:
+            extension = extension_public(target_id, extension_versions, vscode_instances)
+            instances = vscode_instances if vscode_instances is not None else discover_vscode_installations()
+            if not extension["installed"]:
+                return TargetState(
+                    target_id, title, VSCODE_USER_SETTINGS, "missing-extension", "未安装",
+                    f"缺少扩展 · {extension['id']}", False,
+                    extension=extension, discovery=instances,
+                )
+            exists = os.path.isfile(VSCODE_STATE_DB) and os.path.isfile(VSCODE_LOCAL_STATE)
+            config_key, secret_id = VSCODE_PLUGIN_CONFIG[target_id]
+            settings = _load_jsonc(VSCODE_USER_SETTINGS, {}) if os.path.isfile(VSCODE_USER_SETTINGS) else {}
+            url = settings.get(config_key) if isinstance(settings, dict) else None
+            key = _vscode_read_secret_named(secret_id) if exists else None
+            discovery = [*instances]
+            if os.path.isfile(VSCODE_USER_SETTINGS):
+                discovery.append({"path": VSCODE_USER_SETTINGS, "source": "VS Code 用户设置"})
         elif target_id == "claude":
             exists = Path(CLAUDE_SETTINGS).parent.is_dir() or os.path.isfile(CLAUDE_SETTINGS)
             settings = _load_json(CLAUDE_SETTINGS, {}) if exists else {}
             env = settings.get("env", {}) if isinstance(settings, dict) else {}
             url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
             key = (env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")) if isinstance(env, dict) else None
+            discovery = [{"path": CLAUDE_SETTINGS, "source": "标准用户配置"}] if exists else []
         else:
             exists = Path(PI_SETTINGS).parent.is_dir() or os.path.isfile(PI_SETTINGS)
             settings = _load_jsonc(PI_SETTINGS, {}) if exists else {}
@@ -549,16 +1036,24 @@ def _state(target_id: str) -> TargetState:
             provider = providers.get(provider_name, {}) if isinstance(providers, dict) else {}
             url = provider.get("baseUrl") if isinstance(provider, dict) else None
             key = provider.get("apiKey") if isinstance(provider, dict) else None
+            discovery = [{"path": PI_MODELS, "source": "标准用户配置"}] if exists else []
 
         if not exists:
-            return TargetState(target_id, title, location, "missing", "未安装", "没有找到本机配置", False)
+            return TargetState(
+                target_id, title, location, "missing", "未发现", "没有找到本机配置", False,
+                discovery=discovery,
+                extension=locals().get("extension"),
+            )
         return TargetState(
-            target_id, title, location,
+            target_id, title,
+            VSCODE_USER_SETTINGS if target_id in VSCODE_PLUGIN_CONFIG else location,
             "ok" if (url or key) else "ready",
             "已配置" if (url or key) else "可写入",
             _detail(url, key, "已找到应用，可创建配置"),
             True, url, key,
-            "需退出 VS Code 后写入" if target_id == "vscode" and vscode_running() else "",
+            "需退出 VS Code 后写入" if target_id in VSCODE_TARGETS and vscode_running() else "",
+            discovery=discovery,
+            extension=locals().get("extension"),
         )
     except RotationError as exc:
         return TargetState(target_id, title, location, "error", "读取失败", str(exc), False)
@@ -566,12 +1061,23 @@ def _state(target_id: str) -> TargetState:
         return TargetState(target_id, title, location, "error", "读取失败", "配置格式不受支持", False)
 
 
-def detect_targets() -> list[dict]:
-    return [_state(target_id).public() for target_id in TARGET_ORDER]
+def detect_targets(target_options: dict | None = None) -> list[dict]:
+    options = target_options if isinstance(target_options, dict) else {}
+    vscode_instances = discover_vscode_installations()
+    extension_versions = installed_vscode_extensions(vscode_instances)
+    return [
+        _state(
+            target_id,
+            options.get(target_id),
+            extension_versions=extension_versions,
+            vscode_instances=vscode_instances,
+        ).public()
+        for target_id in TARGET_ORDER
+    ]
 
 
-def _plan_hermes(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("hermes"))
+def _plan_hermes(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state("hermes"))
     env_text = _read_text(HERMES_ENV) if os.path.isfile(HERMES_ENV) else ""
     config_text = _read_text(HERMES_CONFIG) if os.path.isfile(HERMES_CONFIG) else ""
     new_env = _env_set(env_text, "OPENAI_API_KEY", api_key)
@@ -584,8 +1090,8 @@ def _plan_hermes(base_url: str, api_key: str) -> TargetPlan:
     return plan
 
 
-def _plan_continue(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("continue"))
+def _plan_continue(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state("continue"))
     text = _read_text(CONTINUE_CONFIG)
     updated = _continue_set(text, base_url, api_key)
     if updated != text:
@@ -593,30 +1099,38 @@ def _plan_continue(base_url: str, api_key: str) -> TargetPlan:
     return plan
 
 
-def _plan_dsh(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("dsh"))
-    settings = _read_text(DSH_SETTINGS)
-    provider = _yaml_get(settings, ("agent-default-model", "provider"))
-    if not provider:
-        providers = _yaml_child_keys(settings, ("llm-pi-ai", "providers"))
-        provider = providers[0] if providers else None
+def _plan_dsh(base_url: str, api_key: str, options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    option = options if isinstance(options, dict) else {}
+    target_state = state or _state("dsh", option)
+    plan = TargetPlan(target_state)
+    settings_path = target_state.location
+    candidates = discover_dsh_configs(str(option.get("settingsPath") or settings_path))
+    candidate = next(
+        (item for item in candidates if os.path.normcase(item["path"]) == os.path.normcase(settings_path)),
+        None,
+    )
+    if not candidate:
+        raise RotationError("dsh 配置位置已变化，请重新检测")
+    credentials_path = candidate["credentialsPath"]
+    settings = _read_text(settings_path)
+    provider = target_state.selected_provider or str(option.get("provider") or "")
     if not provider:
         raise RotationError("dsh 没有可更新的提供方")
     env_name = _yaml_get(settings, ("llm-pi-ai", "providers", provider, "apiKeyEnv"))
     if not env_name:
         raise RotationError("dsh 当前提供方没有 apiKeyEnv")
     updated_settings = _yaml_set(settings, ("llm-pi-ai", "providers", provider, "baseURL"), base_url)
-    credentials = _read_text(DSH_CREDENTIALS) if os.path.isfile(DSH_CREDENTIALS) else "refs:\n"
+    credentials = _read_text(credentials_path) if os.path.isfile(credentials_path) else "refs:\n"
     updated_credentials = _yaml_set(credentials, ("refs", env_name), api_key)
     if updated_settings != settings:
-        plan.changes.append(Change("dsh", DSH_SETTINGS, f"providers.{provider}.baseURL", updated_settings))
+        plan.changes.append(Change("dsh", settings_path, f"providers.{provider}.baseURL", updated_settings))
     if updated_credentials != credentials:
-        plan.changes.append(Change("dsh", DSH_CREDENTIALS, f"refs.{env_name}", updated_credentials))
+        plan.changes.append(Change("dsh", credentials_path, f"refs.{env_name}", updated_credentials))
     return plan
 
 
-def _plan_vscode(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("vscode"))
+def _plan_vscode(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state("vscode"))
     providers = _load_json(CHAT_LM_JSON, [])
     if not isinstance(providers, list):
         raise RotationError("chatLanguageModels.json 顶层必须是数组")
@@ -646,8 +1160,41 @@ def _plan_vscode(base_url: str, api_key: str) -> TargetPlan:
     return plan
 
 
-def _plan_claude(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("claude"))
+def _plan_vscode_plugin(target_id: str, base_url: str, api_key: str, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state(target_id))
+    config_key, secret_id = VSCODE_PLUGIN_CONFIG[target_id]
+    settings = _read_text(VSCODE_USER_SETTINGS) if os.path.isfile(VSCODE_USER_SETTINGS) else "{}\n"
+    updated = _jsonc_set_top_level(settings, config_key, base_url)
+    if updated != settings:
+        def write_setting(config_key=config_key):
+            current = _read_text(VSCODE_USER_SETTINGS) if os.path.isfile(VSCODE_USER_SETTINGS) else "{}\n"
+            _atomic_write_text(VSCODE_USER_SETTINGS, _jsonc_set_top_level(current, config_key, base_url))
+        plan.changes.append(Change(target_id, VSCODE_USER_SETTINGS, config_key, action=write_setting))
+    plan.changes.append(Change(
+        target_id,
+        VSCODE_STATE_DB,
+        f"SecretStorage · {secret_id}",
+        action=lambda secret_id=secret_id: _vscode_write_secret_named(secret_id, api_key),
+    ))
+    if vscode_running():
+        plan.warnings.append("VS Code 正在运行，正式应用前必须完全退出")
+    return plan
+
+
+def _plan_opencode_copilot(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    return _plan_vscode_plugin("opencode_copilot", base_url, api_key, state)
+
+
+def _plan_deepseek_copilot(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    return _plan_vscode_plugin("deepseek_copilot", base_url, api_key, state)
+
+
+def _plan_mimo_copilot(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    return _plan_vscode_plugin("mimo_copilot", base_url, api_key, state)
+
+
+def _plan_claude(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state("claude"))
     settings = _load_json(CLAUDE_SETTINGS, {})
     if not isinstance(settings, dict):
         raise RotationError("Claude Code settings.json 顶层必须是对象")
@@ -665,8 +1212,8 @@ def _plan_claude(base_url: str, api_key: str) -> TargetPlan:
     return plan
 
 
-def _plan_pi(base_url: str, api_key: str) -> TargetPlan:
-    plan = TargetPlan(_state("pi"))
+def _plan_pi(base_url: str, api_key: str, _options: dict | None = None, state: TargetState | None = None) -> TargetPlan:
+    plan = TargetPlan(state or _state("pi"))
     settings = _load_jsonc(PI_SETTINGS, {})
     provider_name = settings.get("defaultProvider") if isinstance(settings, dict) else None
     provider_name = provider_name if isinstance(provider_name, str) and provider_name else "anthropic"
@@ -690,6 +1237,9 @@ PLANNERS = {
     "continue": _plan_continue,
     "dsh": _plan_dsh,
     "vscode": _plan_vscode,
+    "opencode_copilot": _plan_opencode_copilot,
+    "deepseek_copilot": _plan_deepseek_copilot,
+    "mimo_copilot": _plan_mimo_copilot,
     "claude": _plan_claude,
     "pi": _plan_pi,
 }
@@ -730,6 +1280,7 @@ def run_rotation(
     target_ids: list[str] | tuple[str, ...],
     *,
     apply: bool = False,
+    target_options: dict | None = None,
     log: Callable[[str], None] | None = print,
 ) -> dict:
     """预览或执行批量配置。返回值不包含完整密钥。"""
@@ -740,6 +1291,16 @@ def run_rotation(
         raise RotationError("请至少选择一个目标工具")
     if any(target_id not in PLANNERS for target_id in selected):
         raise RotationError("包含不支持的目标工具")
+    options = target_options if isinstance(target_options, dict) else {}
+    if any(key not in selected for key in options):
+        raise RotationError("目标选项与所选工具不一致")
+    for target_id, value in options.items():
+        if target_id != "dsh" or not isinstance(value, dict):
+            raise RotationError("目标选项无效")
+        if any(key not in {"settingsPath", "provider"} for key in value):
+            raise RotationError("dsh 目标选项包含未知字段")
+        if any(not isinstance(item, str) for item in value.values()):
+            raise RotationError("dsh 目标选项格式无效")
 
     messages: list[str] = []
     def emit(message: str = ""):
@@ -747,16 +1308,24 @@ def run_rotation(
         if log:
             log(message)
 
+    vscode_instances = discover_vscode_installations() if any(item in VSCODE_DISCOVERY_TARGETS for item in selected) else []
+    extension_versions = installed_vscode_extensions(vscode_instances) if any(item in EXTENSION_META for item in selected) else {}
     plans: list[TargetPlan] = []
     for target_id in selected:
-        state = _state(target_id)
+        target_option = options.get(target_id)
+        state = _state(
+            target_id,
+            target_option,
+            extension_versions=extension_versions,
+            vscode_instances=vscode_instances,
+        )
         if not state.selectable:
             raise RotationError(f"{state.title} 当前不可写入：{state.detail}")
-        plans.append(PLANNERS[target_id](url, key))
+        plans.append(PLANNERS[target_id](url, key, target_option, state))
     changes = [change for plan in plans for change in plan.changes]
     if not changes:
         raise RotationError("所选工具已经是这组配置，无需修改")
-    if apply and "vscode" in selected and vscode_running():
+    if apply and any(target_id in VSCODE_TARGETS for target_id in selected) and vscode_running():
         raise RotationError("VS Code 正在运行，请完全退出后重新预览")
 
     emit("预览模式，不会写入文件" if not apply else "正在备份并应用更改")
@@ -792,7 +1361,7 @@ def run_rotation(
     return {
         "applied": apply,
         "backup_dir": backup_dir,
-        "vscode_running": vscode_running() if "vscode" in selected else False,
+        "vscode_running": vscode_running() if any(target_id in VSCODE_TARGETS for target_id in selected) else False,
         "target_ids": selected,
         "change_count": len(changes),
         "changes": [
@@ -800,6 +1369,7 @@ def run_rotation(
                 "targetId": plan.target.id,
                 "target": plan.target.title,
                 "file": Path(change.path).name,
+                "path": change.path,
                 "summary": change.summary,
             }
             for plan in plans

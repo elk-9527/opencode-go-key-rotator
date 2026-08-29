@@ -10,117 +10,99 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="#workspace" aria-label="Key Router 首页">
-      <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
-        <path d="M8 9.5h8.5v6H8zM19.5 20.5H28v6h-8.5z"></path>
-        <path d="M16.5 12.5h3.2c4.8 0 4.8 11 0 11h-.2M8 23.5h5.5"></path>
-      </svg>
-      <span><strong>Key Router</strong><small>本地配置台</small></span>
-    </a>
-
-    <div class="topbar-actions">
-      <span class="local-state"><i></i>本地运行</span>
-      <div class="theme-switch" role="radiogroup" aria-label="界面主题">
-        <button type="button" role="radio" aria-checked="false" data-theme-choice="light" title="日间主题">
+  <header class="app-bar">
+    <div class="app-title">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h5v4h-5zM11.5 10.5h5v4h-5zM8.5 7.5H10c2.6 0 2.6 5 0 5H8.5M3.5 12.5h2.8"></path></svg>
+      <h1>Key Router</h1>
+      <span id="versionText">v0.4.0</span>
+    </div>
+    <div class="app-actions">
+      <button class="toolbar-button" id="detectButton" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 6V2.5m0 0H12m3.5 0-2.7 2.7a6 6 0 1 0 1.5 6"></path></svg>
+        重新检测
+      </button>
+      <div class="theme-control" role="radiogroup" aria-label="界面主题">
+        <button type="button" role="radio" aria-checked="false" data-theme-choice="light" title="日间主题" aria-label="日间主题">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.4 4.4l1.4 1.4M14.2 14.2l1.4 1.4M15.6 4.4l-1.4 1.4M5.8 14.2l-1.4 1.4"></path></svg>
-          <span>日间</span>
         </button>
-        <button type="button" role="radio" aria-checked="false" data-theme-choice="dark" title="夜间主题">
+        <button type="button" role="radio" aria-checked="false" data-theme-choice="dark" title="夜间主题" aria-label="夜间主题">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.1A6.7 6.7 0 0 1 7.9 3.6a6.7 6.7 0 1 0 8.5 8.5Z"></path></svg>
-          <span>夜间</span>
         </button>
-        <button type="button" role="radio" aria-checked="true" data-theme-choice="system" title="跟随系统主题">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="10.5" rx="1.5"></rect><path d="M7 17h6M10 14v3"></path></svg>
-          <span>系统</span>
+        <button type="button" role="radio" aria-checked="true" data-theme-choice="system" title="跟随系统" aria-label="跟随系统">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="10.5" rx="1"></rect><path d="M7 17h6M10 14v3"></path></svg>
         </button>
       </div>
-      <button class="icon-button" id="quitButton" type="button" title="关闭软件" aria-label="关闭软件">
+      <button class="icon-button" id="quitButton" type="button" title="关闭" aria-label="关闭软件">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"></path></svg>
       </button>
     </div>
   </header>
 
-  <main class="workspace" id="workspace">
-    <section class="setup-panel" aria-labelledby="connectionTitle">
-      <header class="panel-header">
-        <div>
-          <p class="eyebrow">01 / SOURCE</p>
-          <h1 id="connectionTitle">连接</h1>
+  <main class="app-shell" id="workspace">
+    <aside class="control-pane">
+      <section class="connection-section" aria-labelledby="connectionTitle">
+        <div class="section-heading">
+          <h2 id="connectionTitle">连接参数</h2>
+          <span class="inline-status" id="sourceStatus" data-tone="idle">未填写</span>
         </div>
-        <span class="status-chip" id="sourceStatus" data-tone="idle">等待输入</span>
-      </header>
-
-      <form class="connection-fields" id="connectionForm" novalidate>
-        <label class="field-label" for="urlInput">Base URL</label>
-        <div class="text-field" id="urlField">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"></circle><path d="M3 10h14M10 3a11 11 0 0 1 0 14M10 3a11 11 0 0 0 0 14"></path></svg>
+        <form id="connectionForm" novalidate>
+          <label for="urlInput">Base URL</label>
           <input id="urlInput" name="base-url" type="url" inputmode="url" placeholder="https://api.example.com/v1" autocomplete="url" spellcheck="false">
-        </div>
+          <div class="label-line">
+            <label for="keyInput">API Key</label>
+            <span id="validationText">未输入</span>
+          </div>
+          <div class="key-input">
+            <input id="keyInput" name="api-key" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false">
+            <button id="revealButton" type="button">显示</button>
+          </div>
+        </form>
+      </section>
 
-        <div class="field-label-row">
-          <label class="field-label" for="keyInput">API Key</label>
-          <span id="validationText">未输入</span>
+      <section class="targets-section" aria-labelledby="targetsTitle">
+        <div class="section-heading target-heading">
+          <h2 id="targetsTitle">本机工具 <span id="selectedCount">0</span></h2>
+          <span id="detectSummary">检测中</span>
         </div>
-        <div class="text-field key-field" id="keyField">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="6.5" cy="10" r="3.5"></circle><path d="M10 10h7M14 10v2M16.5 10v2"></path></svg>
-          <input id="keyInput" name="api-key" type="password" placeholder="粘贴 API Key" autocomplete="off" spellcheck="false">
-          <button id="revealButton" type="button" aria-label="显示 API Key">显示</button>
+        <div class="target-list" id="targets" role="list" aria-live="polite">
+          <div class="list-placeholder">正在读取本机配置…</div>
         </div>
-      </form>
+      </section>
+    </aside>
 
-      <div class="target-heading">
+    <section class="work-pane" aria-labelledby="previewTitle">
+      <header class="work-toolbar">
         <div>
-          <p class="eyebrow">02 / TARGETS</p>
-          <h2>目标工具 <span id="selectedCount">0</span></h2>
+          <h2 id="previewTitle">配置检查</h2>
+          <span id="modeText">选择左侧工具查看详情</span>
         </div>
-        <button class="quiet-button" id="detectButton" type="button">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 6V2m0 0h-4m4 0-3 3a6 6 0 1 0 1.5 6"></path></svg>
-          检测
-        </button>
-      </div>
-
-      <div class="target-list" id="targets" aria-live="polite" aria-label="可写入的工具">
-        <div class="target-skeleton"></div>
-        <div class="target-skeleton"></div>
-        <div class="target-skeleton"></div>
-      </div>
-
-      <p class="selection-note" id="detectSummary">正在读取本机配置</p>
-    </section>
-
-    <section class="preview-panel" aria-labelledby="previewTitle">
-      <header class="preview-header">
-        <div>
-          <p class="eyebrow">03 / REVIEW</p>
-          <h2 id="previewTitle">更改预览</h2>
-        </div>
-        <div class="preview-actions">
-          <button class="button button-secondary" id="previewButton" type="button" disabled>生成预览</button>
-          <button class="button button-primary" id="applyButton" type="button" disabled>
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 10 3 3 7-7"></path></svg>
-            应用到所选工具
-          </button>
+        <div class="work-actions">
+          <button class="button secondary" id="previewButton" type="button" disabled>生成预览</button>
+          <button class="button primary" id="applyButton" type="button" disabled>应用更改</button>
         </div>
       </header>
 
-      <div class="summary-rail" aria-label="当前状态">
-        <span><i class="rail-dot"></i><b id="modeText">等待预览</b></span>
-        <span id="changeCount">0 处更改</span>
-        <span>自动备份</span>
-      </div>
-
-      <div class="preview-body" id="previewBody">
-        <div class="empty-state" id="emptyState">
-          <svg viewBox="0 0 72 72" aria-hidden="true">
-            <path d="M14 22h17v12H14zM41 38h17v12H41z"></path>
-            <path d="M31 28h4c8 0 8 16 0 16h-4M14 44h9"></path>
-          </svg>
-          <h3>准备一次批量替换</h3>
-          <p>填写 URL 和 Key，选择工具后生成预览。</p>
+      <section class="inspector" aria-labelledby="inspectorTitle">
+        <div class="inspector-heading">
+          <h3 id="inspectorTitle">发现详情</h3>
+          <span id="inspectorState">—</span>
         </div>
-        <div class="change-list" id="changeList" hidden></div>
-      </div>
+        <div class="inspector-body" id="targetInspector">
+          <p class="plain-empty">检测完成后，在左侧选择一个工具。</p>
+        </div>
+      </section>
+
+      <section class="changes" aria-labelledby="changesTitle">
+        <div class="changes-heading">
+          <h3 id="changesTitle">待修改文件</h3>
+          <span id="changeCount">0</span>
+        </div>
+        <div class="change-table" id="changeList" hidden></div>
+        <div class="changes-empty" id="emptyState">
+          <strong>尚未生成预览</strong>
+          <span>填写连接参数并选择工具。</span>
+        </div>
+      </section>
 
       <details class="run-log" id="logDetails">
         <summary>运行记录 <span id="logCount">0</span></summary>
@@ -129,21 +111,35 @@
     </section>
   </main>
 
-  <footer class="statusbar">
-    <span><i></i><b id="footerStatus">就绪</b></span>
-    <span>凭据脱敏</span>
-    <span>失败自动恢复</span>
-    <span id="versionText">v0.3.0</span>
+  <footer class="status-bar">
+    <span><i></i><b id="footerStatus">本地运行</b></span>
+    <span id="backupHint">备份：%LOCALAPPDATA%\Key Router\backups</span>
+    <span>只写入已勾选项目</span>
   </footer>
 
   <dialog id="confirmDialog">
-    <form method="dialog" class="dialog-card">
-      <span class="dialog-mark" aria-hidden="true">KR</span>
-      <h2>应用这组配置？</h2>
+    <form method="dialog" class="dialog-panel">
+      <h2>确认应用</h2>
       <p id="confirmText">将先创建备份，再写入所选工具。</p>
       <div class="dialog-actions">
-        <button class="button button-secondary" value="cancel">取消</button>
-        <button class="button button-primary" id="confirmApply" value="default">确认应用</button>
+        <button class="button secondary" value="cancel">取消</button>
+        <button class="button primary" id="confirmApply" value="default">应用</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="extensionDialog">
+    <form method="dialog" class="dialog-panel">
+      <h2>安装 VS Code 扩展</h2>
+      <dl class="dialog-meta">
+        <div><dt>扩展</dt><dd id="extensionName">—</dd></div>
+        <div><dt>发布者</dt><dd id="extensionPublisher">—</dd></div>
+        <div><dt>扩展 ID</dt><dd id="extensionId">—</dd></div>
+      </dl>
+      <p>确认后将调用本机 VS Code 安装；安装结果会再次检测。</p>
+      <div class="dialog-actions">
+        <button class="button secondary" value="cancel">取消</button>
+        <button class="button primary" id="confirmInstall" value="default">安装扩展</button>
       </div>
     </form>
   </dialog>
