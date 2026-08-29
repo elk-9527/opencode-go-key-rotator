@@ -186,15 +186,6 @@ def detect() -> dict:
     return result
 
 
-def main_key_from_detect(d: dict) -> str | None:
-    """取最关键的那把 key（VS Code chat.lm.secret 或 Hermes 的）作为旧主 key"""
-    for k in d:
-        v = d[k]
-        if isinstance(v, str) and v.startswith('sk-') and v != 'ERR' and not v.startswith('ERR'):
-            return v
-    return None
-
-
 # ─── 备份 ─────────────────────────────────────────────────────────
 def backup(files: list[str]) -> str:
     ts = time.strftime('%Y%m%d-%H%M%S')
@@ -223,14 +214,34 @@ def replace_in_file(path: str, pairs: list[tuple[str, str]], apply: bool = False
     return changed or [f'[无变化] {path}']
 
 
-def replace_vscode_db(old_key: str, new_key: str, aes_key: bytes, apply: bool) -> list[str]:
-    """state.vscdb：secret 重加密 + 全表字符串替换"""
+def replace_vscode_db(old_key: str, new_key: str, aes_key: bytes, ref_keys: set, apply: bool) -> list[str]:
+    """state.vscdb：secret 重加密 + 全表字符串替换
+
+    ref_keys: 明文配置（.env/Continue/dsh）里读到的 key 集合，用于判断 chat.lm.secret.* 是否属于 opencode
+    重加密规则:
+      - ltmoerdani 扩展的 opencodego.apiKey: 无条件（该键专存 opencode key）
+      - chat.lm.secret.*: 解密值 ∈ ref_keys 才换（避免误伤 Custom Endpoint 等其他 key）
+    """
     msgs = []
     db = sqlite3.connect(VSCODE_STATE_DB)
     try:
         cur = db.cursor()
-        # 1) secret 条目：解密值 == 旧 key 的，重加密为新 key（chat.lm.secret.* 动态发现）
-        for sk in VSCode_SECRET_KEYS + list_vscode_lm_secret_keys(db):
+        EXT_KEY = 'secret://{"extensionId":"ltmoerdani.opencode-copilot-chat","key":"opencodego.apiKey"}'
+        # 1) 扩展专用键：无条件重加密
+        cur.execute('SELECT value FROM ItemTable WHERE key=?', (EXT_KEY,))
+        r = cur.fetchone()
+        if r:
+            try:
+                plain = vscode_secret_decrypt(bytes(json.loads(r[0])['data']), aes_key)
+                if plain.startswith('sk-'):
+                    new_val = json.dumps({'type': 'Buffer', 'data': list(vscode_secret_encrypt(new_key, aes_key))})
+                    if apply:
+                        cur.execute('UPDATE ItemTable SET value=? WHERE key=?', (new_val, EXT_KEY))
+                    msgs.append('  重加密 secret 扩展 opencodego.apiKey (无条件)')
+            except Exception:
+                pass
+        # 2) chat.lm.secret.*：值 ∈ ref_keys 才重加密
+        for sk in list_vscode_lm_secret_keys(db):
             cur.execute('SELECT value FROM ItemTable WHERE key=?', (sk,))
             r = cur.fetchone()
             if not r:
@@ -239,14 +250,14 @@ def replace_vscode_db(old_key: str, new_key: str, aes_key: bytes, apply: bool) -
                 plain = vscode_secret_decrypt(bytes(json.loads(r[0])['data']), aes_key)
             except Exception:
                 continue
-            if plain == old_key:
+            if plain in ref_keys and plain.startswith('sk-'):
                 new_val = json.dumps({'type': 'Buffer', 'data': list(vscode_secret_encrypt(new_key, aes_key))})
                 if apply:
                     cur.execute('UPDATE ItemTable SET value=? WHERE key=?', (new_val, sk))
-                msgs.append(f'  重加密 secret {sk[:44]}...')
+                msgs.append(f'  重加密 secret {sk[:44]}... (匹配明文key)')
             elif isinstance(plain, str) and plain.startswith('sk-'):
                 msgs.append(f'  [保留-不同key] {sk[:44]}... -> {mask(plain)}')
-        # 2) 全表字符串替换 旧key/旧指纹 -> 新key/新指纹
+        # 3) 全表字符串替换 旧key/旧指纹 -> 新key/新指纹
         old_fp, new_fp = fingerprint_of(old_key), fingerprint_of(new_key)
         cur.execute('SELECT key, value FROM ItemTable')
         for k, v in cur.fetchall():
@@ -320,7 +331,13 @@ def main():
         print('[!] 预览模式（dry-run），不写任何文件。加 --apply 执行。')
 
     d = detect()
-    old_key = main_key_from_detect(d)
+    # 明文文件各自读到的 key 集合（作为 VS Code secret 归属判定依据）
+    ref_keys = {v for v in (d.get('Hermes .env'), d.get('Continue config.yaml'), d.get('dsh .credentials.yaml'))
+                if isinstance(v, str) and v.startswith('sk-')}
+    # 主 key：优先明文里最长的（67 位主 key），fallback 到 VS Code 侧
+    main_cands = [v for k, v in d.items() if isinstance(v, str) and v.startswith('sk-')]
+    old_key = sorted(ref_keys, key=len, reverse=True)[0] if ref_keys else (
+        sorted(main_cands, key=len, reverse=True)[0] if main_cands else None)
     if not old_key:
         sys.exit('[!] 无法探测旧 key，请检查各配置是否存在')
     new_key = args.new_key
@@ -350,23 +367,32 @@ def main():
         print('[.] 本次为预览，不产生备份（apply 时自动备份全部文件）')
     print()
 
-    # 1) 明文文件
+    # 1) 明文文件：各自用读到的自身 key 替换（兼容 key 分裂场景）
     print('【1. 明文配置替换】')
-    for f, name in ((HERMES_ENV, 'Hermes .env'), (CONTINUE_CONFIG, 'Continue config.yaml'), (CHAT_LM_JSON, 'chatLanguageModels.json')):
-        msgs = replace_in_file(f, [(old_key, new_key), (old_fp, new_fp)], apply=args.apply)
+    for f, name, dkey in ((HERMES_ENV, 'Hermes .env', 'Hermes .env'),
+                          (CONTINUE_CONFIG, 'Continue config.yaml', 'Continue config.yaml'),
+                          (CHAT_LM_JSON, 'chatLanguageModels.json', None)):
+        file_key = d.get(dkey) if dkey else None
+        if isinstance(file_key, str) and file_key.startswith('sk-'):
+            pairs = [(file_key, new_key), (fingerprint_of(file_key), new_fp)]
+        else:
+            pairs = [(old_key, new_key), (old_fp, new_fp)]
+        msgs = replace_in_file(f, pairs, apply=args.apply)
         print(f'  {name}:')
         for m in msgs:
             print(m)
 
     print()
     print('【2. dsh .credentials.yaml】')
-    for m in replace_in_file(DSH_CREDENTIALS, [(old_key, new_key)], apply=args.apply):
+    dsh_key = d.get('dsh .credentials.yaml')
+    dsh_pairs = [(dsh_key, new_key)] if isinstance(dsh_key, str) and dsh_key.startswith('sk-') else [(old_key, new_key)]
+    for m in replace_in_file(DSH_CREDENTIALS, dsh_pairs, apply=args.apply):
         print(m)
 
     print()
     print('【3. VS Code state.vscdb】')
     aes = get_vscode_aes_key()
-    for m in replace_vscode_db(old_key, new_key, aes, args.apply):
+    for m in replace_vscode_db(old_key, new_key, aes, ref_keys, args.apply):
         print(m)
 
     print()
