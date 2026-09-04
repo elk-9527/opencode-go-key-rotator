@@ -42,6 +42,26 @@ class RotationError(RuntimeError):
     """可安全展示给界面的错误。"""
 
 
+def _console_log(message: str = "") -> None:
+    """在非 UTF-8 Windows 控制台或重定向输出中也不会因中文崩溃。"""
+    stream = sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    safe_message = str(message).encode(encoding, errors="backslashreplace").decode(encoding)
+    print(safe_message, file=stream)
+
+
+def _configure_console_streams() -> None:
+    """CLI 优先输出 UTF-8；不支持 reconfigure 的嵌入式流保持原样。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            continue
+
+
 class ProcessFileLock:
     """跨进程独占锁，防止两个 Key Router 同时修改同一组配置。"""
 
@@ -2821,7 +2841,7 @@ def run_rotation(
     apply: bool = False,
     target_options: dict | None = None,
     expected_plan_digest: str | None = None,
-    log: Callable[[str], None] | None = print,
+    log: Callable[[str], None] | None = _console_log,
 ) -> dict:
     """预览或执行批量配置。返回值不包含完整密钥。"""
     url = validate_base_url(base_url)
@@ -2965,6 +2985,7 @@ def run_rotation(
 
 
 def main():
+    _configure_console_streams()
     parser = argparse.ArgumentParser(description="Key Router · 批量配置 API 地址与密钥")
     parser.add_argument("--detect", action="store_true", help="检测支持的本机工具")
     parser.add_argument("--restore-backup", metavar="DIR", help="从指定的 Key Router 备份目录恢复")

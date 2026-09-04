@@ -6,6 +6,7 @@ import base64
 import ctypes
 import ctypes.wintypes as wt
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -781,6 +782,16 @@ agent-default-model:
         self.assertNotIn("toke", rendered)
         self.assertNotIn("1234", rendered)
         self.assertIn("(9)", rendered)
+
+    def test_console_log_survives_non_utf8_windows_output(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252", write_through=True)
+        try:
+            with mock.patch.object(core.sys, "stdout", stream):
+                core._console_log("预览完成")
+            self.assertIn(b"\\u9884", raw.getvalue())
+        finally:
+            stream.detach()
 
     def test_second_identical_rotation_is_a_noop(self):
         core.run_rotation(

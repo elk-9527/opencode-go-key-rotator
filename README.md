@@ -111,6 +111,8 @@ Get-Content .\key.txt -Raw | python rotate_keys.py --key-stdin --url https://api
 
 兼容参数 `--key` 仍可使用，但它会把密钥留在命令历史中。
 
+命令行会主动使用 UTF-8，并兼容英文区域 Windows 的非 UTF-8 重定向输出。
+
 ## 测试与打包
 
 ```powershell
