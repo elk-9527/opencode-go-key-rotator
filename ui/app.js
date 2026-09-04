@@ -1,4 +1,5 @@
 const state = {
+  accessToken: new URLSearchParams(window.location.hash.slice(1)).get('access') || '',
   token: '',
   busy: false,
   busyAction: '',
@@ -14,6 +15,8 @@ const state = {
   pendingInstaller: null,
   installToken: '',
 };
+
+if (window.location.hash) history.replaceState(null, '', window.location.pathname);
 
 const VSCODE_TARGETS = new Set(['vscode', 'opencode_copilot', 'deepseek_copilot', 'mimo_copilot']);
 const $ = (selector) => document.querySelector(selector);
@@ -89,8 +92,11 @@ function normalizedUrl() {
 
 function validUrl() {
   try {
-    const parsed = new URL(elements.urlInput.value.trim());
+    const raw = elements.urlInput.value.trim();
+    const parsed = new URL(raw);
+    const authority = raw.slice(raw.indexOf('://') + 3).split(/[/?#]/, 1)[0];
     if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    if (authority.endsWith(':')) return false;
     if (parsed.username || parsed.password || parsed.search || parsed.hash) return false;
     if (parsed.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)) return false;
     return Boolean(parsed.hostname);
@@ -111,6 +117,14 @@ function selectedIds() {
 function selectedOptions() {
   const selected = new Set(selectedIds());
   const output = {};
+  if (selected.has('continue') && state.targetOptions.continue) {
+    output.continue = {...state.targetOptions.continue};
+  }
+  VSCODE_TARGETS.forEach((targetId) => {
+    if (selected.has(targetId) && state.targetOptions[targetId]) {
+      output[targetId] = {...state.targetOptions[targetId]};
+    }
+  });
   if (selected.has('dsh') && state.targetOptions.dsh) {
     output.dsh = {...state.targetOptions.dsh};
   }
@@ -151,7 +165,9 @@ function refreshSourceState({invalidate = false} = {}) {
     elements.validationText.textContent = '未输入';
     elements.validationText.dataset.tone = 'idle';
   } else if (keyOkay) {
-    elements.validationText.textContent = `${keyText.slice(0, 4)}••••${keyText.slice(-4)}`;
+    elements.validationText.textContent = keyText.length <= 12
+      ? `${'•'.repeat(keyText.length)} (${keyText.length})`
+      : `••••…${keyText.slice(-4)} (${keyText.length})`;
     elements.validationText.dataset.tone = 'ok';
   } else {
     elements.validationText.textContent = '格式无效';
@@ -179,6 +195,7 @@ function refreshButtons() {
   elements.urlInput.disabled = state.busy;
   elements.keyInput.disabled = state.busy;
   elements.revealButton.disabled = state.busy;
+  elements.quitButton.disabled = state.busy;
   elements.targets.querySelectorAll('input[type="checkbox"]').forEach((input) => {
     const row = input.closest('.target-row');
     input.disabled = state.busy || row?.dataset.selectable !== 'true';
@@ -210,6 +227,7 @@ async function api(path, options = {}) {
     cache: 'no-store',
     headers: {
       'Content-Type': 'application/json',
+      'X-Key-Rotator-Access': state.accessToken,
       ...(options.method ? {'X-Key-Rotator-Token': state.token} : {}),
       ...(options.headers || {}),
     },
@@ -279,20 +297,67 @@ function configureDshCandidate(item, path) {
   const candidate = item.candidates.find((entry) => entry.path === path);
   if (!candidate) return;
   const providers = candidate.providers || [];
-  const preferred = providers.find((provider) => provider.id === candidate.currentProvider && provider.writable)
-    || providers.find((provider) => provider.writable)
-    || null;
+  const requestedProvider = state.targetOptions.dsh?.provider || item.selectedProvider || candidate.currentProvider;
+  const writableProviders = providers.filter((provider) => provider.writable);
+  const preferred = requestedProvider
+    ? (providers.find((provider) => provider.id === requestedProvider && provider.writable) || null)
+    : (writableProviders.length === 1 ? writableProviders[0] : null);
+  const requested = providers.find((provider) => provider.id === requestedProvider) || null;
   item.location = candidate.path;
   item.providers = providers;
-  item.selectedProvider = preferred?.id || '';
+  item.selectedProvider = preferred?.id || requested?.id || '';
   item.selectable = Boolean(preferred);
   const configured = Boolean(preferred?.baseUrl);
   item.state = preferred ? (configured ? 'ok' : 'ready') : 'unsupported';
   item.badge = preferred ? (configured ? '已配置' : '可写入') : '需配置';
-  item.detail = preferred ? (preferred.baseUrl || `提供商 ${preferred.id}`) : '没有带 apiKeyEnv 的可写提供商';
-  state.targetOptions.dsh = {
-    settingsPath: candidate.path,
-    provider: preferred?.id || '',
+  const blocked = requested?.blockedReason ? requested : providers.find((provider) => provider.blockedReason);
+  item.detail = preferred
+    ? (preferred.baseUrl || `提供商 ${preferred.id}`)
+    : (blocked?.blockedReason || (writableProviders.length > 1 ? '请选择要轮换的提供商' : '没有带 apiKeyEnv 的可写提供商'));
+  state.targetOptions.dsh = {settingsPath: candidate.path, provider: preferred?.id || ''};
+}
+
+function configureContinueModel(item, modelIndex) {
+  const model = (item.providers || []).find((entry) => entry.id === String(modelIndex));
+  item.selectedProvider = model?.id || '';
+  item.selectable = Boolean(model?.writable);
+  item.state = model ? (model.writable ? (model.baseUrl ? 'ok' : 'ready') : 'unsupported') : 'selection-required';
+  item.badge = model ? (model.writable ? (model.baseUrl ? '已配置' : '可写入') : '不可写') : '需选择';
+  item.detail = model
+    ? (model.writable ? `${model.name}${model.provider ? ` · ${model.provider}` : ''}` : model.blockedReason)
+    : `发现 ${(item.providers || []).length} 个模型，请选择要轮换的模型`;
+  if (model?.writable) {
+    state.targetOptions.continue = {modelIndex: model.id};
+  } else {
+    delete state.targetOptions.continue;
+  }
+}
+
+function configureOpenCodeVendor(item, vendorId) {
+  const vendor = (item.providers || []).find((entry) => entry.id === String(vendorId));
+  item.selectedProvider = vendor?.id || '';
+  item.selectable = Boolean(vendor?.writable);
+  item.state = vendor ? (vendor.writable ? (vendor.baseUrl ? 'ok' : 'ready') : 'byok-managed') : 'selection-required';
+  item.badge = vendor ? (vendor.writable ? (vendor.baseUrl ? '已配置' : '可写入') : '由 VS Code 管理') : '需选择';
+  item.detail = vendor
+    ? (vendor.writable ? (vendor.baseUrl || `将更新 ${vendor.name}`) : `${vendor.name} 已由 VS Code BYOK 分组管理`)
+    : '请选择 OpenCode Go 或 OpenCode Zen';
+  if (vendor) {
+    state.targetOptions.opencode_copilot = {
+      ...(state.targetOptions.opencode_copilot || {}),
+      vendor: vendor.id,
+    };
+  } else {
+    delete state.targetOptions.opencode_copilot;
+  }
+}
+
+function configureVscodeProfile(item, userDataDir) {
+  const profile = (item.candidates || []).find((entry) => entry.path === userDataDir);
+  if (!profile) return;
+  state.targetOptions[item.id] = {
+    ...(state.targetOptions[item.id] || {}),
+    userDataDir: profile.path,
   };
 }
 
@@ -368,6 +433,7 @@ function renderInspector(item) {
       item.selectedProvider = providerSelect.value;
       const provider = item.providers.find((entry) => entry.id === providerSelect.value);
       if (provider) {
+        item.selectable = Boolean(provider.writable);
         item.detail = provider.baseUrl || `提供商 ${provider.id}`;
         item.state = provider.baseUrl ? 'ok' : 'ready';
         item.badge = provider.baseUrl ? '已配置' : '可写入';
@@ -381,6 +447,81 @@ function renderInspector(item) {
     locate.type = 'button';
     locate.addEventListener('click', pickDshConfig);
     controls.append(pathLabel, providerLabel, locate);
+    elements.targetInspector.append(controls);
+  }
+
+  if (item.id === 'continue' && item.providers?.length) {
+    const controls = node('div', 'choice-panel');
+    const modelLabel = node('label', '', '目标模型');
+    const modelSelect = node('select');
+    if (item.providers.length > 1) {
+      const placeholder = node('option', '', '请选择要轮换的模型');
+      placeholder.value = '';
+      placeholder.selected = !state.targetOptions.continue?.modelIndex;
+      modelSelect.append(placeholder);
+    }
+    item.providers.forEach((model) => {
+      const details = [model.provider, model.model].filter(Boolean).join(' / ');
+      const option = node('option', '', `${model.name}${details ? ` — ${details}` : ''}${model.writable ? '' : ' · 不可写'}`);
+      option.value = model.id;
+      option.disabled = !model.writable;
+      option.selected = model.id === (state.targetOptions.continue?.modelIndex || item.selectedProvider);
+      modelSelect.append(option);
+    });
+    modelSelect.addEventListener('change', () => {
+      configureContinueModel(item, modelSelect.value);
+      invalidatePreview();
+      replaceTarget(item);
+    });
+    modelLabel.append(modelSelect);
+    controls.append(modelLabel);
+    elements.targetInspector.append(controls);
+  }
+
+  if (item.id === 'opencode_copilot' && item.providers?.length) {
+    const controls = node('div', 'choice-panel');
+    const vendorLabel = node('label', '', 'OpenCode 提供商');
+    const vendorSelect = node('select');
+    item.providers.forEach((vendor) => {
+      const option = node('option', '', `${vendor.name}${vendor.writable ? '' : ' · 由 VS Code BYOK 管理'}`);
+      option.value = vendor.id;
+      option.selected = vendor.id === (state.targetOptions.opencode_copilot?.vendor || item.selectedProvider);
+      vendorSelect.append(option);
+    });
+    vendorSelect.addEventListener('change', () => {
+      configureOpenCodeVendor(item, vendorSelect.value);
+      invalidatePreview();
+      replaceTarget(item);
+    });
+    vendorLabel.append(vendorSelect);
+    controls.append(vendorLabel);
+    elements.targetInspector.append(controls);
+  }
+
+  if (VSCODE_TARGETS.has(item.id) && item.candidates?.length > 1) {
+    const controls = node('div', 'choice-panel');
+    const profileLabel = node('label', '', 'VS Code 用户数据');
+    const profileSelect = node('select');
+    const placeholder = node('option', '', '请选择要修改的 VS Code 配置');
+    placeholder.value = '';
+    placeholder.selected = !state.targetOptions[item.id]?.userDataDir && !item.selectedProfile;
+    profileSelect.append(placeholder);
+    item.candidates.forEach((profile) => {
+      const option = node('option', '', `${profile.source} — ${profile.path}`);
+      option.value = profile.path;
+      option.selected = profile.path === (state.targetOptions[item.id]?.userDataDir || item.selectedProfile);
+      profileSelect.append(option);
+    });
+    profileSelect.addEventListener('change', async () => {
+      if (!profileSelect.value) return;
+      configureVscodeProfile(item, profileSelect.value);
+      invalidatePreview();
+      await detect();
+      state.selectedTargetId = item.id;
+      renderTargets(state.targets);
+    });
+    profileLabel.append(profileSelect);
+    controls.append(profileLabel);
     elements.targetInspector.append(controls);
   }
 
@@ -490,13 +631,32 @@ async function detect() {
   clearLog();
   appendLog('读取配置、命令和开始菜单快捷方式…');
   try {
-    const data = await api('/api/detect');
+    const data = await api('/api/detect-options', {
+      method: 'POST',
+      body: JSON.stringify({targetOptions: state.targetOptions}),
+    });
     state.vscodeRunning = data.vscodeRunning;
     const dsh = data.items.find((item) => item.id === 'dsh');
     if (dsh?.candidates?.length) {
       const candidate = dsh.candidates.find((entry) => entry.path === state.targetOptions.dsh?.settingsPath)
         || dsh.candidates[0];
       configureDshCandidate(dsh, candidate.path);
+    }
+    const continueTarget = data.items.find((item) => item.id === 'continue');
+    if (continueTarget?.providers?.length) {
+      const previousModel = state.targetOptions.continue?.modelIndex;
+      if (previousModel && continueTarget.providers.some((model) => model.id === previousModel)) {
+        configureContinueModel(continueTarget, previousModel);
+      } else if (continueTarget.providers.length === 1) {
+        configureContinueModel(continueTarget, continueTarget.providers[0].id);
+      } else {
+        delete state.targetOptions.continue;
+      }
+    }
+    const openCodeTarget = data.items.find((item) => item.id === 'opencode_copilot');
+    if (openCodeTarget?.providers?.length) {
+      const requestedVendor = state.targetOptions.opencode_copilot?.vendor || openCodeTarget.selectedProvider || 'opencodego';
+      configureOpenCodeVendor(openCodeTarget, requestedVendor);
     }
     renderTargets(data.items);
     const selectable = data.items.filter((item) => item.selectable).length;
@@ -509,6 +669,7 @@ async function detect() {
     setMode('选择工具查看路径与发现来源');
     setFooter('本地运行');
   } catch (error) {
+    state.installToken = '';
     elements.detectSummary.textContent = '检测失败';
     setMode('检测失败');
     setFooter('错误');
@@ -538,6 +699,7 @@ async function pickDshConfig() {
     invalidatePreview();
     showToast('已采用所选 DSH 配置', 'ok');
   } catch (error) {
+    state.installToken = '';
     appendLog(error.message, 'error');
     showToast(error.message, 'error');
   } finally {
@@ -644,7 +806,8 @@ async function installPendingAgent() {
     });
     appendLog(`安装完成：${data.installed.name} ${data.installed.version}`, 'ok');
     appendLog(`位置：${data.installed.location}`, 'ok');
-    showToast(`${data.installed.name} 安装完成`, 'ok');
+    if (data.installed.warning) appendLog(data.installed.warning, 'warn');
+    showToast(data.installed.warning || `${data.installed.name} 安装完成`, data.installed.warning ? 'warn' : 'ok');
     state.pendingInstaller = null;
     state.installToken = '';
     elements.installDialog.close();
@@ -656,13 +819,15 @@ async function installPendingAgent() {
     elements.logDetails.open = true;
     elements.installProgressText.textContent = error.message;
     elements.installProgress.dataset.tone = 'error';
-    elements.installNote.textContent = '安装未完成。可以检查网络后重试，已安装的其他工具不会受影响。';
+    elements.installNote.textContent = installer.pathMode === 'fixed'
+      ? '安装未完成。请检查网络，关闭此窗口后再次点击安装。'
+      : '安装未完成。请检查目标目录，重新选择安装位置后再试。';
     showToast(error.message, 'error');
   } finally {
     state.busy = false;
     state.busyAction = '';
     elements.installForm.removeAttribute('aria-busy');
-    elements.confirmInstall.lastChild.textContent = '重试';
+    elements.confirmInstall.lastChild.textContent = state.installToken ? '重试' : '需要重新确认';
     elements.cancelInstall.disabled = false;
     elements.chooseInstallLocation.disabled = false;
     setFooter('本地运行');
@@ -772,6 +937,12 @@ elements.quitButton.addEventListener('click', async () => {
   window.close();
 });
 
+window.addEventListener('beforeunload', (event) => {
+  if (!state.busy) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
 async function init() {
   applyTheme(document.documentElement.dataset.theme || 'system', {persist: false});
   refreshSourceState();
@@ -782,7 +953,7 @@ async function init() {
     elements.versionText.textContent = `v${session.version}${session.demo ? ' · DEMO' : ''}`;
     if (session.demo) {
       elements.urlInput.value = 'https://api.example.com/v1';
-      elements.keyInput.value = 'sk-demo-1234567890-example';
+      elements.keyInput.value = 'demo-local-key-1234567890-example';
       refreshSourceState();
     }
     await detect();

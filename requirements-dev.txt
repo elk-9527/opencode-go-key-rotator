@@ -1,0 +1,4 @@
+-r requirements-build.txt
+bandit==1.8.6
+pip-audit==2.10.1
+ruff==0.12.12

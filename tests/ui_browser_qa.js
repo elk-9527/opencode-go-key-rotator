@@ -4,7 +4,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const {spawn} = require('child_process');
+const {spawn, spawnSync} = require('child_process');
 
 const playwrightPath = process.env.PLAYWRIGHT_CORE_PATH || 'playwright-core';
 const {chromium} = require(playwrightPath);
@@ -20,12 +20,18 @@ async function main() {
   const portFile = path.join(temp, 'server.port');
   const outputDir = path.resolve('output/playwright');
   fs.mkdirSync(outputDir, {recursive: true});
+  const isolatedPaths = JSON.stringify({
+    APP_SETTINGS: path.join(temp, 'app-settings.json'),
+    BACKUP_DIR: path.join(temp, 'backups'),
+  });
   const app = spawn(executable, ['--demo', '--no-open'], {
-    env: {...process.env, RK_PORT_FILE: portFile},
+    env: {...process.env, RK_PORT_FILE: portFile, RK_PATHS_JSON: isolatedPaths},
     windowsHide: true,
     stdio: 'ignore',
   });
   let browser;
+  let serverInfo;
+  let baseUrl = '';
   try {
     const deadline = Date.now() + 30000;
     while (!fs.existsSync(portFile) && Date.now() < deadline) {
@@ -33,8 +39,10 @@ async function main() {
       await wait(100);
     }
     if (!fs.existsSync(portFile)) throw new Error('打包程序没有报告端口');
-    const port = Number(fs.readFileSync(portFile, 'utf8'));
-    const url = `http://127.0.0.1:${port}/`;
+    serverInfo = JSON.parse(fs.readFileSync(portFile, 'utf8'));
+    const port = Number(serverInfo.port);
+    baseUrl = `http://127.0.0.1:${port}/`;
+    const url = `${baseUrl}#access=${encodeURIComponent(serverInfo.accessToken)}`;
 
     browser = await chromium.launch({
       headless: true,
@@ -51,7 +59,7 @@ async function main() {
 
     await page.goto(url, {waitUntil: 'networkidle'});
     await page.waitForFunction(() => document.querySelectorAll('.target-row').length === 9);
-    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.5.0 · DEMO') throw new Error('界面版本号不正确');
+    if ((await page.locator('#versionText').textContent()).trim() !== 'v0.6.0 · DEMO') throw new Error('界面版本号不正确');
     if ((await page.locator('.target-row').count()) !== 9) throw new Error('目标数量不正确');
     const dshRow = page.locator('.target-row').filter({hasText: 'dsh'}).first();
     if (!(await dshRow.locator('.target-state').textContent()).includes('已配置')) throw new Error('dsh 配置状态显示错误');
@@ -77,17 +85,17 @@ async function main() {
     if (!(await page.locator('#applyButton').isDisabled())) throw new Error('演示模式错误地允许真实应用');
     if ((await page.locator('.change-row').count()) !== 9) throw new Error('预览变更数量不正确');
     const visibleText = await page.locator('body').innerText();
-    if (visibleText.includes('sk-demo-1234567890-example')) throw new Error('页面正文泄露了完整 API Key');
+    if (visibleText.includes('demo-local-key-1234567890-example')) throw new Error('页面正文泄露了完整 API Key');
     const wideOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (wideOverflow) throw new Error('宽屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v050.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v060.png'), fullPage: true});
     await page.screenshot({path: path.resolve('docs/key-router-ui.png'), fullPage: true});
 
     await page.setViewportSize({width: 760, height: 900});
     await wait(250);
     const narrowOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
     if (narrowOverflow) throw new Error('窄屏布局出现横向溢出');
-    await page.screenshot({path: path.join(outputDir, 'key-router-v050-narrow.png'), fullPage: true});
+    await page.screenshot({path: path.join(outputDir, 'key-router-v060-narrow.png'), fullPage: true});
     if (consoleProblems.length) throw new Error(`浏览器控制台异常：${consoleProblems.join(' | ')}`);
 
     await page.locator('#quitButton').click();
@@ -98,7 +106,35 @@ async function main() {
     console.log('UI browser QA: OK (themes, installer, preview, responsive, console, shutdown)');
   } finally {
     if (browser) await browser.close();
-    if (app.exitCode === null) app.kill();
+    if (app.exitCode === null && baseUrl && serverInfo?.accessToken) {
+      try {
+        const accessHeaders = {'X-Key-Rotator-Access': serverInfo.accessToken};
+        const sessionResponse = await fetch(`${baseUrl}api/session`, {headers: accessHeaders});
+        const session = await sessionResponse.json();
+        await fetch(`${baseUrl}api/shutdown`, {
+          method: 'POST',
+          headers: {
+            ...accessHeaders,
+            'Content-Type': 'application/json',
+            'X-Key-Rotator-Token': session.token,
+          },
+          body: '{}',
+        });
+        await Promise.race([
+          new Promise((resolve) => app.once('exit', resolve)),
+          wait(5000),
+        ]);
+      } catch (_) {
+        // 继续执行仅针对本测试子进程的兜底清理。
+      }
+    }
+    if (app.exitCode === null) {
+      if (process.platform === 'win32') {
+        spawnSync('taskkill', ['/PID', String(app.pid), '/T', '/F'], {windowsHide: true});
+      } else {
+        app.kill('SIGTERM');
+      }
+    }
     fs.rmSync(temp, {recursive: true, force: true});
   }
 }

@@ -8,4 +8,5 @@ build/
 dist/
 output/
 test_env/
+internal-research/
 *.spec.bak

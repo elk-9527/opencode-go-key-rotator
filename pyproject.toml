@@ -1,0 +1,11 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "output", "dist", "build"]
+skips = ["B404", "B603", "B607"]
